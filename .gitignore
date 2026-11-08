@@ -1,0 +1,5 @@
+verify/node_modules/
+verify/shots/*
+!verify/shots/.gitkeep
+*.log
+.DS_Store

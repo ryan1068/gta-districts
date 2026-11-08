@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>穿环飞行 Ring Flight</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Ccircle cx=%2216%22 cy=%2216%22 r=%2211%22 fill=%22none%22 stroke=%22%235fd0ff%22 stroke-width=%224%22/%3E%3C/svg%3E">
+<style>
+  :root{ --ink:#dbe7ff; --dim:#7f93b8; --accent:#5fd0ff; --bad:#ff6b81; }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; background:#070b18; color:var(--ink);
+    font:15px/1.5 -apple-system,"PingFang SC","Helvetica Neue",sans-serif; overflow:hidden; }
+  canvas{ display:block; width:100%; height:100%; touch-action:none; }
+  #hud{ position:fixed; inset:0; pointer-events:none; }
+  .stat{ position:absolute; top:16px; letter-spacing:.02em; }
+  .stat b{ display:block; font-size:30px; font-weight:650; font-variant-numeric:tabular-nums; }
+  .stat span{ font-size:11px; text-transform:uppercase; letter-spacing:.14em; color:var(--dim); }
+  #s-score{ left:20px; } #s-boost{ left:50%; transform:translateX(-50%); text-align:center; }
+  #s-life{ right:20px; text-align:right; }
+  #combo{ position:absolute; top:74px; left:20px; font-size:15px; color:var(--accent); opacity:0; transition:opacity .2s; }
+  #lives{ font-size:22px; letter-spacing:.12em; }
+  #veil{ position:fixed; inset:0; display:grid; place-items:center; text-align:center;
+    background:radial-gradient(120% 90% at 50% 40%,rgba(7,11,24,.55),rgba(7,11,24,.9)); }
+  #veil > div{ padding:30px 42px; border-radius:16px; background:rgba(7,11,24,.8);
+    border:1px solid rgba(95,208,255,.16); backdrop-filter:blur(7px); }
+  #veil[hidden]{ display:none; }
+  #veil h1{ margin:0 0 6px; font-size:40px; font-weight:680; letter-spacing:.04em; }
+  #veil p{ margin:0 0 22px; color:var(--dim); max-width:36ch; }
+  #veil .big{ font-size:54px; font-weight:700; color:var(--accent); font-variant-numeric:tabular-nums; }
+  #veil kbd{ display:inline-block; min-width:20px; padding:1px 6px; margin:0 2px; border-radius:5px;
+    border:1px solid #33456b; background:#111c33; color:var(--ink); font:12px ui-monospace,monospace; }
+  #veil button{ margin-top:8px; padding:11px 26px; font:inherit; font-weight:600; color:#04121f;
+    background:var(--accent); border:0; border-radius:9px; cursor:pointer; }
+  #veil button:hover{ filter:brightness(1.12); }
+  .err{ position:fixed; left:12px; bottom:12px; right:12px; padding:10px 12px; border-radius:8px;
+    background:#3a1020; color:#ffd8de; font:12px ui-monospace,monospace; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="hud">
+  <div class="stat" id="s-score"><span>得分</span><b id="score">0</b></div>
+  <div class="stat" id="s-boost"><span>推进 ×2</span><b id="boost">—</b></div>
+  <div class="stat" id="s-life"><span>剩余</span><div id="lives">●●●</div></div>
+  <div id="combo"></div>
+</div>
+
+<div id="veil">
+  <div>
+    <h1 id="v-title">穿环飞行</h1>
+    <p id="v-text">穿过每一个发光的环。<br>
+      <kbd>←</kbd><kbd>→</kbd><kbd>↑</kbd><kbd>↓</kbd> 或 <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> 驾驶,<kbd>Shift</kbd> 推进(得分翻倍),也可以直接移动鼠标转向。<br><kbd>P</kbd> 切换自动驾驶演示,<kbd>R</kbd> 重新开始。</p>
+    <div class="big" id="v-num"></div>
+    <div><button id="go">开始</button></div>
+    <p style="margin-top:16px">最高分 <span id="best">0</span> · <kbd>R</kbd> 重新开始 · 想看演示:<a href="?autopilot" style="color:#5fd0ff">自动驾驶</a></p>
+  </div>
+</div>
+
+<script type="module" src="./game.js"></script>
+</body>
+</html>

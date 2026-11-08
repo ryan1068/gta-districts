@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>侠盗街区 · 第一期:驾驶</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect x=%226%22 y=%2212%22 width=%2220%22 height=%2210%22 rx=%223%22 fill=%22%23e0553f%22/%3E%3Ccircle cx=%2211%22 cy=%2223%22 r=%223%22 fill=%22%23222%22/%3E%3Ccircle cx=%2221%22 cy=%2223%22 r=%223%22 fill=%22%23222%22/%3E%3C/svg%3E">
+<style>
+  :root{ --ink:#e8eefc; --dim:#8fa0bd; --accent:#ffcf5c; }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; background:#101418; color:var(--ink); overflow:hidden;
+    font:15px/1.5 -apple-system,"PingFang SC","Helvetica Neue",sans-serif; }
+  canvas{ display:block; width:100%; height:100%; }
+  #hud{ position:fixed; inset:0; pointer-events:none; }
+  #kmh{ position:absolute; right:22px; bottom:18px; text-align:right; }
+  #kmh b{ display:block; font-size:46px; font-weight:700; font-variant-numeric:tabular-nums; line-height:1; }
+  #kmh span{ font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--dim); }
+  #mode{ position:absolute; left:20px; top:16px; }
+  #mode b{ display:block; font-size:13px; color:var(--accent); letter-spacing:.1em; }
+  #mode span{ font-size:11px; color:var(--dim); letter-spacing:.14em; text-transform:uppercase; }
+  #hits{ position:absolute; left:20px; top:62px; font-size:13px; color:var(--dim); }
+  #keys{ position:absolute; left:20px; bottom:18px; font-size:12px; color:var(--dim); max-width:44ch; }
+  #keys b{ color:var(--ink); }
+  #keys kbd, .big kbd{ display:inline-block; min-width:18px; padding:1px 5px; margin:0 1px; border-radius:4px;
+    border:1px solid #3a4557; background:#1b222d; font:11px ui-monospace,monospace; color:var(--ink); }
+  #veil{ position:fixed; inset:0; display:grid; place-items:center; text-align:center;
+    background:radial-gradient(120% 90% at 50% 40%,rgba(16,20,24,.5),rgba(16,20,24,.9)); }
+  #veil[hidden]{ display:none; }
+  #veil > div{ padding:30px 42px; border-radius:16px; background:rgba(16,20,24,.85);
+    border:1px solid rgba(255,207,92,.16); backdrop-filter:blur(7px); }
+  #veil h1{ margin:0 0 4px; font-size:34px; font-weight:680; }
+  #veil .sub{ margin:0 0 18px; color:var(--accent); font-size:13px; letter-spacing:.14em; text-transform:uppercase; }
+  #veil p{ margin:0 0 18px; color:var(--dim); max-width:38ch; }
+  #veil button{ padding:11px 26px; font:inherit; font-weight:600; color:#1a1206; background:var(--accent);
+    border:0; border-radius:9px; cursor:pointer; }
+  #veil a{ color:var(--accent); }
+  .err{ position:fixed; left:12px; bottom:12px; right:12px; padding:10px 12px; border-radius:8px;
+    background:#3a1020; color:#ffd8de; font:12px ui-monospace,monospace; white-space:pre-wrap; z-index:9; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="hud">
+  <div id="mode"><span>状态</span><b id="modev">开车</b></div>
+  <div id="hits">撞击 <b id="hitsv">0</b> 次 · 撞/打人 <b id="pedsv">0</b> 人 · 街区 <b id="blocksv">0</b></div>
+  <div id="kmh"><b id="kmh">0</b><span>km/h</span></div>
+  <div id="keys"><b>驾驶</b> <kbd>↑</kbd><kbd>↓</kbd>/<kbd>W</kbd><kbd>S</kbd> 油门刹车 · <kbd>←</kbd><kbd>→</kbd>/<kbd>A</kbd><kbd>D</kbd> 转向 · <kbd>Space</kbd> 手刹漂移<br>
+    <b>步行</b> <kbd>WASD</kbd> 移动(W=屏幕纵深,A/D=横移) · <kbd>Shift</kbd> 跑 · <kbd>Space</kbd> 跳 · <kbd>F</kbd> 上下最近的车(可抢别人的) · <kbd>G</kbd> 打人 · <kbd>R</kbd> 回到路口重来<br>
+    <b>视角</b> <kbd>C</kbd> 切机位(常规 / 贴目标低角 / 高俯视) · 按住鼠标拖 = 转镜头 · 滚轮 = 拉近拉远 · 松手一秒半后自动回正</div>
+</div>
+
+<div id="veil">
+  <div>
+    <h1>侠盗街区</h1>
+    <div class="sub">第一期 · 驾驶 + 车流 + 行人</div>
+    <p>城市活了:右边来车你得让,行人逼近会闪、碾到会躺。<br>警察和任务还没来 —— 先把这满街的车和人开顺。</p>
+    <div><button id="go">开始开车</button></div>
+    <p style="margin-top:16px;font-size:12px"><a href="../">← 回去玩穿环飞行</a></p>
+  </div>
+</div>
+
+<script type="module" src="./game.js"></script>
+</body>
+</html>
