@@ -385,7 +385,10 @@ if (Y) {
   const canRam = myTop - 11 > 6;
   console.log(`(顶车组:当前车实测极速 ${myTop} m/s,${canRam ? '够' : '不够'}闭合 6 m/s 撞击阈值)`);
   let a = null;
-  for (let ramN = 0; ramN < 2; ramN++) {
+  // 最多 3 次重新对准的追尾(见下方换目标重试):单发/双发在某些车流种子上会连着栽进
+  // "目标一路让路、我贴尾蠕行、闭合差够不到 +6"的环境形态(3wh04a 实测连黑两轮,
+  // 但人工按车头方向从正后方 26 米追,一发就 +1)。多给一发只是多一次对齐机会,判据不变。
+  for (let ramN = 0; ramN < 3; ramN++) {
   const tgt2 = await page.evaluate((o, n) => {
     const G = window.__gta;
     // 上一轮观测里它若已被红绿灯车流/行人刹停,顶车就不该拿链尾的定住车测:
@@ -438,8 +441,8 @@ if (Y) {
   // 换目标重试两种"环境背锅"形态:
   // ① 计数 +1 但顶了个纹丝不动(撞到已被别的东西刹停的链尾车,推-回坑循环);
   // ② 计数 +0 —— run6 实测:它让路溜走后恢复巡航、我全程贴着它尾部蠕行,
-  //    闭合速度 4 m/s 够不到 +6 阈值(挪了 27 米、峰速 7.8,推力本身没事)。换一辆再测,第二轮还黑才认失败。
-  if (ramN === 0 && canRam && (a.ramHits === 0 || (a.moved <= 0.6 && tgtSpdMax <= 1))) {
+  //    闭合速度 4 m/s 够不到 +6 阈值(挪了 27 米、峰速 7.8,推力本身没事)。换一辆再测,第三轮还黑才认失败。
+  if (ramN < 2 && canRam && (a.ramHits === 0 || (a.moved <= 0.6 && tgtSpdMax <= 1))) {
     await page.evaluate(() => { const G = window.__gta; G.standAt(G.x + 3, G.z + 22); });
     await sleep(S(2200));                                      // 短暂离场让车流散开,别把上一辆的队列带进下一轮
     await page.evaluate(() => { const G = window.__gta; G.spawnAt(G.x + 1.5, G.z + 1.5, 0); });
@@ -713,6 +716,57 @@ await page.screenshot({ path: import.meta.dirname + '/shots/w1-peds.png' });
   }
   check('Space 跳起落后归零', peak > 0.5 && peak < 1.7 && landed,
     `峰值 ${peak.toFixed(2)} 米${landed ? ',已落地' : ',2.5 仿真秒内没落地'}`);
+}
+
+// 进店(传送式):全城 5 家铺子,门口按 E 进预制室内,再按 E 回到门前。
+// 这里验的不是"屋里好不好看",是这条传送链物理上成不成立:落脚点干净、进出可逆、
+// 屋内是密封的(四面走穿不出墙)、相机夹在屋里、出门后全城碰撞盒一颗不多一颗不少。
+{
+  const doors = await page.evaluate(() => window.__gta.shopDoors);
+  const blocked = await page.evaluate((ds) => ds
+    .map((d) => ({ ...d, bad: window.__gta.probeSolid(d.x + d.nx * 1.4, d.z + d.nz * 1.4, 0.5) }))
+    .filter((d) => d.bad).map((d) => d.name), doors);
+  check('全城标了 5 家可进店、门前落脚点无一被顶',
+    doors.length === 5 && new Set(doors.map((d) => d.name)).size === 5 && blocked.length === 0,
+    `家数=${doors.length} 被顶=[${blocked.join(',')}]`);
+  const d0 = doors[0];
+  await page.evaluate(([x, z]) => window.__gta.footAt(x, z), [d0.x + d0.nx * 1.4, d0.z + d0.nz * 1.4]);
+  await sleep(S(500));
+  const gAt0 = await g();
+  const hintText = await page.evaluate(() => document.getElementById('hint').textContent);
+  check('站门口 HUD 提示 + shopNear 都报出店名',
+    gAt0.shopNear === d0.name && hintText.includes('按 E 进入'), `shopNear=${gAt0.shopNear} hint="${hintText}"`);
+  const solidB = gAt0.solidCount;
+  await page.keyboard.press('e');
+  await sleep(S(500));
+  const gIn = await g();
+  const room = gIn.shopRoom;
+  const cam1 = await page.evaluate(() => window.__gta.camEye);
+  check('门口按 E 进屋:店名对、人在屋框内、碰撞盒挂上、相机瞬移在屋内',
+    gIn.inShop === d0.name && room && Math.abs(gIn.x) < room.w / 2 && Math.abs(gIn.z) < room.d / 2
+    && gIn.solidCount > solidB
+    && Math.abs(cam1.x) < room.w / 2 + 0.4 && Math.abs(cam1.z) < room.d / 2 + 0.4
+    && cam1.y > 0.5 && cam1.y < room.h - 0.4,
+    `inShop=${gIn.inShop} 人=(${gIn.x},${gIn.z}) 屋=${room && room.w}×${room && room.d} 障碍 ${solidB}→${gIn.solidCount} 相机=(${cam1.x},${cam1.y},${cam1.z})`);
+  await page.screenshot({ path: import.meta.dirname + '/shots/w2-shop-inside.png' });
+  // 四个方向各从屋子正中走 1.2 仿真秒:最远也只能贴到墙,穿不出屋(店内 pushOut 已整套换成屋里盒)
+  let maxAx = 0, maxAz = 0;
+  for (const k of ['w', 'a', 's', 'd']) {
+    await page.evaluate(() => window.__gta.footAt(0, 0));
+    await sleep(S(300));
+    await hold([k], 1200);
+    const q = await g();
+    maxAx = Math.max(maxAx, Math.abs(q.x)); maxAz = Math.max(maxAz, Math.abs(q.z));
+  }
+  check('屋内四向推进都穿不出墙', maxAx <= room.w / 2 + 0.2 && maxAz <= room.d / 2 + 0.2,
+    `最远 (${maxAx.toFixed(1)},${maxAz.toFixed(1)}) 半屋 ${(room.w / 2).toFixed(1)}×${(room.d / 2).toFixed(1)}`);
+  await page.keyboard.press('e');   // 出门
+  await sleep(S(500));
+  const gOut = await g();
+  const distDoor = Math.hypot(gOut.x - d0.x, gOut.z - d0.z);
+  check('再按 E 出门:回自家门前(世界坐标)、碰撞盒整段摘净',
+    gOut.inShop === null && distDoor > 0.5 && distDoor < 4.5 && gOut.solidCount === solidB,
+    `inShop=${gOut.inShop} 离门 ${distDoor.toFixed(1)} 米 障碍 ${solidB}→${gOut.solidCount}`);
 }
 
 // 步行特写:看小人还是不是"老头"

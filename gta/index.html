@@ -21,6 +21,9 @@
   #hits{ position:absolute; left:20px; top:62px; font-size:13px; color:var(--dim); }
   #keys{ position:absolute; left:20px; bottom:18px; font-size:12px; color:var(--dim); max-width:44ch; }
   #keys b{ color:var(--ink); }
+  #hint{ position:absolute; left:50%; bottom:86px; transform:translateX(-50%); padding:6px 14px; border-radius:9px;
+    font-size:14px; color:var(--accent); background:rgba(16,20,24,.78); border:1px solid rgba(255,207,92,.35);
+    white-space:nowrap; opacity:0; transition:opacity .15s; }
   #keys kbd, .big kbd{ display:inline-block; min-width:18px; padding:1px 5px; margin:0 1px; border-radius:4px;
     border:1px solid #3a4557; background:#1b222d; font:11px ui-monospace,monospace; color:var(--ink); }
   #veil{ position:fixed; inset:0; display:grid; place-items:center; text-align:center;
@@ -45,8 +48,9 @@
   <div id="mode"><span>状态</span><b id="modev">开车</b></div>
   <div id="hits">撞击 <b id="hitsv">0</b> 次 · 撞/打人 <b id="pedsv">0</b> 人 · 街区 <b id="blocksv">0</b></div>
   <div id="kmh"><b id="kmh">0</b><span>km/h</span></div>
+  <div id="hint"></div>
   <div id="keys"><b>驾驶</b> <kbd>↑</kbd><kbd>↓</kbd>/<kbd>W</kbd><kbd>S</kbd> 油门刹车 · <kbd>←</kbd><kbd>→</kbd>/<kbd>A</kbd><kbd>D</kbd> 转向 · <kbd>Space</kbd> 手刹漂移<br>
-    <b>步行</b> <kbd>WASD</kbd> 移动(W=屏幕纵深,A/D=横移) · <kbd>Shift</kbd> 跑 · <kbd>Space</kbd> 跳 · <kbd>F</kbd> 上下最近的车(可抢别人的) · <kbd>G</kbd> 打人 · <kbd>R</kbd> 回到路口重来<br>
+    <b>步行</b> <kbd>WASD</kbd> 移动(W=屏幕纵深,A/D=横移) · <kbd>Shift</kbd> 跑 · <kbd>Space</kbd> 跳 · <kbd>F</kbd> 上下最近的车(可抢别人的) · <kbd>G</kbd> 打人 · <kbd>E</kbd> 进/出亮门店铺 · <kbd>R</kbd> 回到路口重来<br>
     <b>视角</b> <kbd>C</kbd> 切机位(常规 / 贴目标低角 / 高俯视) · 按住鼠标拖 = 转镜头 · 滚轮 = 拉近拉远 · 松手一秒半后自动回正</div>
 </div>
 

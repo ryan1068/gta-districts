@@ -82,6 +82,16 @@ scene.add(ground);
 
 const solids = [];                       // 所有不能穿过去的东西(AABB)
 const addSolid = (x, z, w, d, h = 1) => solids.push({ x, z, hw: w / 2, hd: d / 2, h });
+// 声明贴在 solids 旁边:选店铺要在生成阶段就问 probeSolid,而 probeSolid 读这个集合 ——
+// 挪在后面任何一处都会让店铺代码先撞 TDZ(实测页面白屏:Cannot access 'solidsOff' before initialization)。
+const solidsOff = new Set();                 // 暂时不算障碍的 solid 下标 = 你正开着的那辆
+
+// ── 进店状态:必须在 solids 消费方(probeSolid/pushOut)之前声明 ──
+// 店内碰撞盒只在"人在店里"这段时间挂在 solids 尾部(s.interior 标记,出门整段截掉)。
+// 过滤规矩是 `inside ? 只留 interior : 只丢 interior` —— 别写成 s.interior !== inside:
+// 门外一侧 undefined !== false 恒真,会把全城障碍全滤光,人能直接穿楼走。
+let inside = null;                        // 人在哪家店里(null=街上);它同时是碰撞过滤开关
+let curShop = null, solidMark = 0, heroWasVisible = true;
 
 const rand = (a, b) => a + rng() * (b - a);
 const pick = (arr) => arr[(rng() * arr.length) | 0];
@@ -451,6 +461,78 @@ clutter(new THREE.CylinderGeometry(0.5, 0.5, 1, 6),
   scene.add(trunk, leaf);
 }
 
+// ══ 可进店:全城标 5 家推得开门的铺子(门口按 E 传进预制室内,再按 E 走回街上)══
+// 规矩:
+//  · 只在普通矮楼里挑 footprint ≥13.2 米的 —— 高楼是天际线道具,不该能钻进去;
+//  · 每个街区最多 1 家,选铺用 Fisher-Yates 洗牌后的顺序 —— 洗牌即散点,不会扎堆一角;
+//  · 门开在离最近马路那一面的墙上,门前 1.4 米必须站得住(probeSolid 干净),
+//    不行退试次近的一面,两面都不行这块地就换下一家;
+//  · 洗牌在这里消耗 rng —— 老种子的车流/行人位置会变,楼群不变(rng 流从这段才分叉)。
+// 室内不在这建:第一次进哪家才现建哪家(buildShop),屋子坐落世界原点,
+// 靠一圈 BackSide 黑壳把街上的一切挡在屋外,见 buildShop 里的注释。
+const SHOP_KINDS = [
+  { name: '老张面馆', glow: 0xff7043, floor: 0x8a6f52 },
+  { name: '街口超市', glow: 0x53a6ff, floor: 0x8d8f96 },
+  { name: '修车铺',   glow: 0xffc24a, floor: 0x6e737a },
+  { name: '社区诊所', glow: 0x4fd17c, floor: 0x9fa79f },
+  { name: '电玩厅',   glow: 0xb06bff, floor: 0x565064 },
+];
+const shops = [];
+{
+  const cands = bld.filter((b) => !b.tall && b.w >= 13.2 && b.d >= 13.2);
+  for (let i = cands.length - 1; i > 0; i--) {          // Fisher-Yates
+    const j = (rng() * (i + 1)) | 0; const tv = cands[i]; cands[i] = cands[j]; cands[j] = tv;
+  }
+  const taken = new Set();
+  for (let pass = 0; pass < 2 && shops.length < 5; pass++) {
+    const usedBlocks = new Set();                        // 第二轮放宽街区名额(只防同一家楼标两次)
+    for (const b of cands) {
+      if (shops.length >= 5) break;
+      if (taken.has(b)) continue;
+      const bk = ((b.x + HALF) / PERIOD | 0) * GRID + ((b.z + HALF) / PERIOD | 0);
+      if (usedBlocks.has(bk)) continue;
+      const hw = b.w / 2, hd = b.d / 2;
+      const rx = camPath(Math.round((b.x + HALF) / PERIOD));   // 最近竖路中线
+      const rz = camPath(Math.round((b.z + HALF) / PERIOD));   // 最近横路中线
+      const faces = [
+        { nx: 1, nz: 0, g: Math.abs(rx - (b.x + hw)) },
+        { nx: -1, nz: 0, g: Math.abs((b.x - hw) - rx) },
+        { nx: 0, nz: 1, g: Math.abs(rz - (b.z + hd)) },
+        { nx: 0, nz: -1, g: Math.abs((b.z - hd) - rz) },
+      ].sort((p, q) => p.g - q.g);
+      let face = null, dx = 0, dz = 0, tOff = 0;
+      for (const f of faces.slice(0, 2)) {               // 最近两面各试;都不行换下一家
+        const tl = f.nx ? b.d : b.w;
+        for (const tryT of [0, rand(-0.18, 0.18) * tl]) {
+          const gx2 = f.nx ? b.x + f.nx * hw : b.x + tryT;
+          const gz2 = f.nx ? b.z + tryT : b.z + f.nz * hd;
+          if (!probeSolid(gx2 + f.nx * 1.4, gz2 + f.nz * 1.4, 0.5)) {
+            face = f; dx = gx2; dz = gz2; tOff = tryT; break;
+          }
+        }
+        if (face) break;
+      }
+      if (!face) continue;
+      usedBlocks.add(bk); taken.add(b);
+      const K = SHOP_KINDS[shops.length % SHOP_KINDS.length];
+      const glowM = new THREE.MeshBasicMaterial({ color: K.glow, toneMapped: false });
+      const stepM = new THREE.MeshStandardMaterial({ color: 0x3c424c, roughness: 0.9 });
+      const door = new THREE.Group();
+      const mk = (sw, sh, sd, x, y, z, mat) => {
+        const m = new THREE.Mesh(unitBox, mat);
+        m.position.set(x, y, z); m.scale.set(sw, sh, sd);
+        m.castShadow = false; m.receiveShadow = false; door.add(m);
+      };
+      // 沿墙尺寸看朝向:朝 ±x 的门,宽度落在 z 轴上
+      mk(face.nx ? 0.14 : 1.6, 2.15, face.nx ? 1.6 : 0.14, dx + face.nx * 0.1, 1.08, dz + face.nz * 0.1, glowM);
+      mk(face.nx ? 0.22 : 2.3, 0.5, face.nx ? 2.3 : 0.22, dx + face.nx * 0.18, 2.78, dz + face.nz * 0.18, glowM);
+      mk(face.nx ? 1.1 : 1.9, 0.06, face.nx ? 1.9 : 1.1, dx + face.nx * 0.85, 0.05, dz + face.nz * 0.85, stepM);
+      scene.add(door);
+      shops.push({ i: shops.length, K, b, face, t: tOff, dx, dz, built: false, group: null, room: null, solidSpecs: [] });
+    }
+  }
+}
+
 // ── 车型:五种俯视轮廓互不相同的车 ──
 // 同类共用一套实例化几何,所以开销跟着"种类"涨、不跟着"数量"涨。
 // body/cab = [长, 宽, 高, 沿车头方向的偏移];wz = 前后轴位置;z 正向 = 车头
@@ -490,7 +572,7 @@ for (const k in GEO) {                       // 由轮径和车壳高度推出�
 // 下车时再塞回去 —— 所以你走开后车还站在原地,没有消失。
 const CARC = [0xd94f3d, 0x3f6fa8, 0xd8c65a, 0x8b8f96, 0x2f3238, 0x6a9c5d, 0xb9b2a3, 0x2c6f6a, 0xa34a3f];
 const cars = [];
-const solidsOff = new Set();                 // 暂时不算障碍的 solid 下标 = 你正开着的那辆
+// solidsOff 挪到了 solids 旁边(选店铺时 probeSolid 要在生成阶段就用它)
 let mode = 'car';                            // car | foot
 let active = null, myCar = null;             // 正在开的 / 和你绑定的那辆(车顶标记跟着它)
 
@@ -1144,7 +1226,8 @@ const blipGroup = new THREE.Group();
   scene.add(blipGroup);
 }
 function updateBlip() {
-  const show = !!myCar && active !== myCar;
+  // 在店里时黑壳罩不住"就停在门外两步内"的那辆被偷车,标记也会悬在屋里 —— 直接不显示
+  const show = !!myCar && active !== myCar && !inside;
   blipGroup.visible = show;
   if (show) blipGroup.position.set(myCar.x, 0, myCar.z);
 }
@@ -1324,7 +1407,7 @@ const spawn = () => {
 };
 spawn();
 
-function placeAt(x, z, h) { putCarAt(x, z, h); }
+function placeAt(x, z, h) { if (inside) exitShop(); putCarAt(x, z, h); }   // 在店里被 R/harness 拽走:先算出门,再把人塞进车
 
 // 最近路口(按网格吸附)
 function nearestCrossing(x, z) {
@@ -1337,6 +1420,7 @@ function probeSolid(x, z, r = 0, skip = -1, carsToo = true) {
   for (let i = 0; i < solids.length; i++) {
     if (solidsOff.has(i) || i === skip) continue;
     const s = solids[i];
+    if (!!s.interior !== !!inside) continue;     // 店里只问店内盒,街上只问街上盒
     if (!carsToo && s.car) continue;             // 只问建筑时用这刀:车流合法擦边不该算"穿楼"
     // "点到矩形的真实距离"(和 pushOut/resolveCar 同一把尺子),不是"扩盒命中":
     // 扩盒在楼角处必命中 —— 车身顶在拐角上时中心已被顶到 ≥r(物理没错),
@@ -1364,9 +1448,13 @@ function pushOutStatic(x, z, r) {           // 只被静止障碍顶:车流之�
   return { x, z };
 }
 function pushOut(x, z, r) {              // 推出所有重叠实体,返回修正后的位置
+  // 只有主角走路用它(车流/路人都走 pushOutStatic)—— 所以可以按"人在不在店里"整套换盒子:
+  // 店里:外面全城障碍(包括原点那块地上的楼)不再挡人,只剩店里的墙和家具;
+  // 街上:店里的碰撞盒此时压根不存在(进门才挂、出门截掉),这条过滤是双保险。
   for (let i = 0; i < solids.length; i++) {
     if (solidsOff.has(i)) continue;
     const s = solids[i];
+    if (!!s.interior !== !!inside) continue;
     const nx = Math.max(s.x - s.hw, Math.min(x, s.x + s.hw));
     const nz = Math.max(s.z - s.hd, Math.min(z, s.z + s.hd));
     const dx = x - nx, dz = z - nz;
@@ -1381,6 +1469,130 @@ function pushOut(x, z, r) {              // 推出所有重叠实体,返回修�
 }
 
 
+// ══ 进店/出门(传送式,方案 B)══
+// 人进屋后 px/pz 直接当屋内坐标用(屋子坐落世界原点,px 本来就直接喂 man.position ——
+// 一套坐标三方共用:物理、人物、相机)。屋外的城市在屋里不参与物理(pushOut 的 interior
+// 过滤),所以原点那块地上的楼不会在店里立隐形墙。
+function buildShop(s) {
+  const g = new THREE.Group();
+  const w = s.b.w - 1.0, d = s.b.d - 1.0, ht = 3.1, th = 0.3;   // 室内净尺寸:四面墙吃掉 1 米见方
+  s.room = { w, d, h: ht };
+  const glow = new THREE.MeshBasicMaterial({ color: s.K.glow, toneMapped: false });
+  const warm = new THREE.MeshBasicMaterial({ color: 0xffe9c4, toneMapped: false });
+  const floorM = new THREE.MeshStandardMaterial({ color: s.K.floor, roughness: 0.85 });
+  const wallM = new THREE.MeshStandardMaterial({ color: 0xd4cec2, roughness: 0.92 });
+  const ceilM = new THREE.MeshStandardMaterial({ color: 0xb3aca0, roughness: 0.95 });
+  const std = (c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.8 });
+  const spec = [];
+  const bx = (x, y, z, sw, sh, sd, mat, solid) => {
+    const m = new THREE.Mesh(unitBox, mat);
+    m.position.set(x, y, z); m.scale.set(sw, sh, sd);
+    m.castShadow = false; m.receiveShadow = false; g.add(m);   // 屋内不吃日光投影(斜射会拉出斜影穿墙)
+    if (solid) spec.push({ x, z, hw: sw / 2, hd: sd / 2, h: sh });
+    return m;
+  };
+  bx(0, -0.07, 0, w + 2 * th, 0.14, d + 2 * th, floorM, false);
+  const wallX = (x) => bx(x, ht / 2, 0, th, ht, d + 2 * th, wallM, true);
+  const wallZ = (z) => bx(0, ht / 2, z, w + 2 * th, ht, th, wallM, true);
+  wallX(w / 2 + th / 2); wallX(-(w / 2 + th / 2)); wallZ(d / 2 + th / 2); wallZ(-(d / 2 + th / 2));
+  bx(0, ht + 0.09, 0, w + 2 * th, 0.18, d + 2 * th, ceilM, false);
+  // 外黑壳:BackSide 的"里衬"盒 —— 店里看到的永远只有屋里:楼/树/人/车/地面全被这圈
+  // 比屋子大 6 米的不透光盒子挡在墙外(店里只有一间房亮着这件事靠它兜底,不靠运气)。
+  const shell = new THREE.Mesh(unitBox, new THREE.MeshBasicMaterial({ color: 0x12141a, side: THREE.BackSide }));
+  shell.position.set(0, 3, 0); shell.scale.set(w + 2 * th + 6, 9.4, d + 2 * th + 6); g.add(shell);
+  // 门那一面:里侧发光门板(出门就靠它指路)+ 两扇亮窗给屋里"借"点街光
+  const fx = s.face.nx, fz = s.face.nz;
+  const lx = fx ? fx * (w / 2 - 0.04) : s.t, lz = fx ? s.t : fz * (d / 2 - 0.04);
+  bx(lx, 1.05, lz, fx ? 0.06 : 1.5, 2.1, fx ? 1.5 : 0.06, glow, false);
+  const span = (fx ? d : w) * 0.27;
+  for (const off of [span, -span]) {
+    if (fx) bx(lx, 1.6, off, 0.05, 1.0, 2.0, glow, false); else bx(off, 1.6, lz, 2.0, 1.0, 0.05, glow, false);
+  }
+  for (const off of [d * 0.22, -d * 0.22]) bx(0, ht - 0.04, off, 1.3, 0.05, 0.34, warm, false);   // 顶灯两条
+  // ── 陈设(按店种)── prop 是落地实盒:家具全进碰撞,推桌子推不动
+  const prop = (x, z, sw, sd, sh, c) => bx(x, sh / 2, z, sw, sh, sd, std(c), true);
+  const k = s.i % SHOP_KINDS.length;
+  if (k === 0) {                                    // 面馆:柜台 + 一桌四凳 + 后墙冰柜
+    prop(-w * 0.24, -d * 0.18, 3.0, 0.9, 1.05, 0xb4875a);
+    prop(w * 0.16, d * 0.06, 1.5, 1.5, 0.75, 0xd8c9a8);
+    for (const [ax, az] of [[0.72, 0], [-0.72, 0], [0, 0.72], [0, -0.72]]) prop(w * 0.16 + ax, d * 0.06 + az, 0.42, 0.42, 0.46, 0x8f5f3a);
+    prop(w * 0.32, -d * 0.3, 1.1, 1.1, 1.9, 0x9aa2a8);
+  } else if (k === 1) {                             // 超市:三排货架 + 门边收银台
+    for (const off of [-w * 0.28, 0, w * 0.28]) prop(off, -d * 0.1, 0.9, d * 0.55, 1.8, 0x7f8894);
+    prop(w * 0.2, d * 0.32, 1.3, 0.8, 0.95, 0x4a7fb5);
+  } else if (k === 2) {                             // 修车铺:举升台上一台没修完的车 + 工具箱
+    prop(-w * 0.06, -d * 0.16, 3.0, 2.0, 0.3, 0x4a5058);
+    prop(-w * 0.06, -d * 0.16, 3.6, 1.7, 0.95, 0xc0504a);   // 车壳:一个实盒够撞,漆面高光靠两条哑光块凑
+    prop(-w * 0.06, -d * 0.16, 1.8, 1.45, 0.5, 0x8a3b36);
+    prop(w * 0.3, d * 0.18, 1.0, 0.7, 1.1, 0xc94f3d);
+    prop(-w * 0.38, d * 0.3, 0.9, 0.9, 1.6, 0x5d6570);
+  } else if (k === 3) {                             // 诊所:前台 + 两条长椅 + 药柜
+    prop(-w * 0.2, -d * 0.22, 2.4, 0.9, 1.0, 0xd9dee3);
+    prop(w * 0.12, d * 0.16, 1.8, 0.55, 0.5, 0x8d9aa5);
+    prop(w * 0.12, d * 0.38, 1.8, 0.55, 0.5, 0x8d9aa5);
+    prop(-w * 0.34, d * 0.28, 1.2, 0.5, 1.9, 0xe6ebe8);
+  } else {                                          // 电玩厅:沿墙四台机子(发光脸)+ 一桌
+    for (const off of [-w * 0.34, -w * 0.12, w * 0.12, w * 0.34]) prop(off, -d * 0.34, 1.0, 0.8, 1.7, 0x2e3340);
+    prop(-w * 0.34, -d * 0.34 + 0.43, 0.86, 0.05, 0.5, s.K.glow);   // 屏幕脸三块:Basic 不受光,黑柜里自己就是光源
+    prop(0, -d * 0.34 + 0.43, 0.86, 0.05, 0.5, s.K.glow);            // (四台的斜脸做不了:盒盒都是轴对齐的,三块已经够点亮屋子)
+    prop(w * 0.34, -d * 0.34 + 0.43, 0.86, 0.05, 0.5, s.K.glow);
+    prop(0, d * 0.2, 2.0, 1.2, 0.75, 0x3a4150);
+  }
+  s.solidSpecs = spec;
+  g.visible = false; scene.add(g);
+  s.group = g; s.built = true;
+}
+
+function enterShop(s) {
+  if (inside || mode !== 'foot') return;
+  if (!s.built) buildShop(s);
+  s.group.visible = true;
+  curShop = s; inside = s;
+  solidMark = solids.length;
+  for (const sp of s.solidSpecs) solids.push({ x: sp.x, z: sp.z, hw: sp.hw, hd: sp.hd, h: sp.h, interior: true });
+  // 进门起点在门同侧、往屋里让 1.8 米(门线上有建筑碰撞盒,起点直接给屋里免被顶一帧)
+  const fx = s.face.nx, fz = s.face.nz;
+  heroWasVisible = hero.visible;
+  px = fx ? fx * (s.room.w / 2 - 1.8) : s.t * 0.6; pz = fx ? s.t * 0.6 : fz * (s.room.d / 2 - 1.8);
+  py = 0; vy = 0; grounded = true;
+  walkYaw = camYaw = Math.atan2(-fx, -fz); manYaw = walkYaw;   // 进屋先面向屋里,W 立刻可用
+  userYaw = 0; userPitch = 0; userZoom = 1; holdT = 99;
+  // 相机瞬移到位(平滑 6/s 从 24 米外的街上拉回来要飞两秒,穿帮);黑壳圈外顺路灭掉
+  // 街上人偶和主角车,屋里不该看见"自己"停在门外,出门全部还原。
+  camX = px + Math.sin(camYaw) * 5.1; camZ = pz + Math.cos(camYaw) * 5.1;
+  camY = Math.min(2.5, s.room.h - 0.6);
+  for (const m of PED_MESHES) m.visible = false;
+  hero.visible = false; blobGroup.visible = false;
+}
+
+function exitShop() {
+  if (!inside) return;
+  solids.length = solidMark;                     // 店内碰撞盒整段摘除(它们在表尾,车/街区的下标不动)
+  const s = curShop;
+  s.group.visible = false;
+  // 出门落点必须换算成世界坐标:屋里的 px/pz 是"以原点屋子为中心"的局部系,一出门它就是全城坐标。
+  // 门前 1.6 米这个落脚点,生成时已按 1.4 米 / 0.5 身宽验过干净(比门口还外挪 0.2,稳)。
+  px = s.dx + s.face.nx * 1.6; pz = s.dz + s.face.nz * 1.6;
+  py = 0; vy = 0; grounded = true;
+  walkYaw = camYaw = Math.atan2(s.face.nx, s.face.nz); manYaw = ph = walkYaw;   // 背门面向街,W 直接走
+  // 相机瞬移回街上机位(人后 18.7 米、屋顶上方 24.4 米):让阻尼从屋里慢慢飞要横穿大半座城。
+  // 街上相机本来就压在屋顶之上,高度不用另算;机位落在人背后的街面延长线上。
+  camX = px - s.face.nx * 18.7; camZ = pz - s.face.nz * 18.7; camY = 24.4;
+  inside = null; curShop = null;
+  for (const m of PED_MESHES) m.visible = true;
+  hero.visible = heroWasVisible;
+  blobGroup.visible = true;                      // 步行分支只挪斑不显斑,这里必须还给 true,出店人就永久没影了
+}
+
+const nearShop = () => {                          // 门口 2.8 米内才算"够得着门"
+  let best = null, bd = 2.8;
+  for (const s of shops) {
+    const dd = Math.hypot(px - s.dx, pz - s.dz);
+    if (dd < bd) { bd = dd; best = s; }
+  }
+  return best;
+};
+
 // ══ 输入 ══
 const keys = new Set();
 addEventListener('keydown', (e) => {
@@ -1391,8 +1603,14 @@ addEventListener('keydown', (e) => {
     const [cx, cz] = nearestCrossing(hx, hz);
     placeAt(cx, cz, hh);
   }
-  if (k === 'f' && state === 'play') toggleCar();
-  if (k === 'g' && state === 'play' && mode === 'foot') punch();
+  // E:店门进出的唯一键。在店里按 = 出门(不管离门多远);在街上只认"步行 + 够得着门"。
+  // F/R 在店里按 = 先出门再走各自流程(开车流程按屋里那套局部坐标算会驴唇不对马嘴)。
+  if (k === 'e' && state === 'play') {
+    if (inside) exitShop();
+    else if (mode === 'foot') { const s2 = nearShop(); if (s2) enterShop(s2); }
+  }
+  if (k === 'f' && state === 'play') { if (inside) exitShop(); else toggleCar(); }
+  if (k === 'g' && state === 'play' && mode === 'foot' && !inside) punch();
   // Space 在步行时=跳;开车里的 Space 是漂移手刹(见 keys.has(' ')),两套模式各用各的。
   // e.repeat 拦掉长按连跳 —— 按住 Space 该是站着的一个人,不该成弹簧腿。
   if (k === ' ' && state === 'play' && mode === 'foot' && grounded && !e.repeat) { vy = JUMP_V; grounded = false; }
@@ -1519,6 +1737,30 @@ addEventListener('wheel', (e) => { userZoom = clamp(userZoom + e.deltaY * 0.0012
 addEventListener('contextmenu', (e) => e.preventDefault());
 
 function updateCamera(dt, tx, tz, thead, speed) {
+  if (inside) {
+    // ── 店内机位:人在后 5 米、高 2 米的小 30° 吊杆,拖拽/滚轮照常能用,但 XZ 被夹在
+    // 屋墙里 0.6 米(相机穿墙 = 满屏黑,夹比遮挡便宜)。街上那套 24 米压屋顶的公式整个
+    // 不换过来:3.1 米的屋子里,24 米的杆子会把天花板怼出画面外 —— C 机位/wantDist 在屋里不参与。
+    holdT += dt;
+    if (!dragging && holdT > 1.6) {
+      const rec = 1 - Math.exp(-2.2 * (holdT - 1.6) * dt);
+      userYaw -= userYaw * rec; userPitch -= userPitch * rec;
+    }
+    camYaw += shortAngle(thead + userYaw - camYaw) * (1 - Math.exp(-5.5 * dt));
+    if (Math.abs(dragYaw) > 1e-4) { camYaw += dragYaw; dragYaw = 0; }   // 拖动即时生效,和街上一致
+    const rad = 30 * Math.PI / 180 + clamp(userPitch, -0.3, 0.08);
+    const dist = 5.0 + (userZoom - 1) * 1.6;
+    const horiz = dist * Math.cos(rad), high = dist * Math.sin(rad);
+    const lag = 1 - Math.exp(-9 * dt);
+    camX += (tx - Math.sin(camYaw) * horiz - camX) * lag;
+    camZ += (tz - Math.cos(camYaw) * horiz - camZ) * lag;
+    camY += (Math.min(inside.room.h - 0.55, 1.05 + high) - camY) * lag;
+    const mx = inside.room.w / 2 - 0.6, mz = inside.room.d / 2 - 0.6;   // 夹在墙内 0.6 米
+    camX = clamp(camX, -mx, mx); camZ = clamp(camZ, -mz, mz);
+    camera.position.set(camX, camY, camZ);
+    camera.lookAt(tx + Math.sin(camYaw) * 1.6, 1.0, tz + Math.cos(camYaw) * 1.6);
+    return;
+  }
   const cp = CAM_PRESETS[camPreset];
   // 步行取景 = 开车取景完全同款(用户拍板:"切成和开车一样,不用放大"):30 米挂 23 米高,
   // 越过屋顶线(楼高上限 11 米)看人 —— 开车在楼群里穿行不怕挡镜头的机制,步行原样继承。
@@ -1704,10 +1946,17 @@ function frame(now) {
 
   const sp = mode === 'car' ? Math.hypot(vx, vz) : 0;
   $('kmh').textContent = Math.round(sp * 3.6);
+  $('kmh').style.opacity = mode === 'car' ? '' : '0';   // 步行时速度表让位:那块大数是汽车的仪表盘,人走路报 5km/h 没意义
   $('modev').textContent = mode === 'car' ? '开车' : '步行';
   $('hitsv').textContent = hits;
   $('pedsv').textContent = pedHits;
   $('blocksv').textContent = blockTypes.filter((t) => t === 0).length + ' 楼区 / ' + parks.length + ' 公园 / ' + lots.length + ' 停车场';
+  // 门口提示:走近某家店报"按 E 进入 XX",在店里常驻"按 E 离店"(店里有去无回会懵)
+  const hintEl = $('hint');
+  const nearIn = (inside || state !== 'play' || mode !== 'foot') ? null : nearShop();
+  const htxt = inside ? `按 E 离店 · ${inside.K.name}` : nearIn ? `按 E 进入 ${nearIn.K.name}` : '';
+  hintEl.textContent = htxt;
+  hintEl.style.opacity = htxt ? '1' : '0';
 
   requestAnimationFrame(frame);
 }
@@ -1740,7 +1989,14 @@ function resolveCar(r) {
 window.__gta = {
   seed: SEED.toString(36),               // 本次城市种子:红了拿它拼进 ?seed= 重放同一座城
   get jumpH() { return +py.toFixed(2); },   // 离地高度(米),步行跳才有值
-  footAt(x, z) { px = x; pz = z; py = 0; vy = 0; grounded = true; },   // 步行瞬移(harness 专用):不上下车,竖直态复位站稳
+  footAt(x, z) { px = x; pz = z; py = 0; vy = 0; grounded = true; },   // 步行瞬移(harness 专用):不上下车,竖直态复位站稳。在店里时坐标是屋内局部系
+  get inShop() { return inside ? inside.K.name : null; },
+  get shopRoom() { return inside ? { w: +inside.room.w.toFixed(2), d: +inside.room.d.toFixed(2), h: inside.room.h } : null; },
+  get shopDoors() { return shops.map((s) => ({ name: s.K.name, x: +s.dx.toFixed(1), z: +s.dz.toFixed(1), nx: s.face.nx, nz: s.face.nz })); },
+  get shopNear() { if (inside) return 'in'; const s2 = nearShop(); return s2 ? s2.K.name : null; },   // 门口 2.8 米内报店名,否则 null
+  get camEye() { return { x: +camX.toFixed(2), y: +camY.toFixed(2), z: +camZ.toFixed(2) }; },          // 相机真实位置(店内机位是否钻墙用)
+  enterShop() { if (!inside && mode === 'foot') { const s2 = nearShop(); if (s2) enterShop(s2); } return inside ? inside.K.name : null; },
+  exitShop,                                            // 出门走的是和按 E 同一条路径,测的就是玩家路径本身
   get bldMatCount() { return bldMats.length; },   // 墙面贴图类数(5 = 普通 4 类 + 高楼 1 类)
   get state() { return state; }, get mode() { return mode; },
   get x() { return +(mode === 'car' ? hx : px).toFixed(2); },
@@ -1927,7 +2183,7 @@ window.__gta = {
   // 自由视角的接管状态:0=全自动跟车,1=你正按住鼠标,还有 userYaw 是拖了多少弧度
   get camGrab() { return dragging ? 1 : (userYaw > 0.05 || userYaw < -0.05 || userPitch < -0.02 || userPitch > 0.02 || Math.abs(userZoom - 1) > 0.02) ? 1 : 0; },
   get camPreset() { return camPreset; },                 // 0 常规 / 1 贴目标低角 / 2 高俯视
-  probeSolid: (x, z) => probeSolid(x, z, 0),
+  probeSolid: (x, z, r = 0) => probeSolid(x, z, r),   // r 可传:门口落脚点要按 0.5 米身宽问,不许测试自己另造一把尺子
   spawnAt: (x, z, h) => placeAt(x, z, h ?? 0),
   set fov(v) { camera.fov = v; camera.updateProjectionMatrix(); },
   // 与显卡无关的真实开销指标;timeScale=1 表示满速,小于 1 说明机器跟不上
