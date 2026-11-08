@@ -1,8 +1,8 @@
 import puppeteer from 'puppeteer-core';
 
-// 城市种子每轮随机:红的时候把打印出来的这行 seed 拼回 URL(?seed=)就能原样重放那座城,
-// "偶发红"从此变成"必现红"。不带 seed 的游戏本体每次也是随机城,互不影响。
-const SEED = ((Date.now() ^ (Math.random() * 4294967296)) >>> 0).toString(36);
+// 城市种子每轮随机:红的时候把打印出来的这行 seed 直接喂回套件(`node gta.mjs <seed>`)
+// 就能原样重放那座城,"偶发红"从此变成"必现红"。不带 seed 的游戏本体每次也是随机城,互不影响。
+const SEED = process.argv[2] || ((Date.now() ^ (Math.random() * 4294967296)) >>> 0).toString(36);
 const URL = `http://127.0.0.1:8017/gta/?autostart&noshadow&seed=${SEED}`;   // 软渲染下阴影会把游戏时间拖慢,测逻辑不需要它
 console.log(`城市种子 seed=${SEED}(红了拿 ?seed=${SEED} 重放)`);
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -729,6 +729,11 @@ await page.screenshot({ path: import.meta.dirname + '/shots/w1-peds.png' });
   check('全城标了 5 家可进店、门前落脚点无一被顶',
     doors.length === 5 && new Set(doors.map((d) => d.name)).size === 5 && blocked.length === 0,
     `家数=${doors.length} 被顶=[${blocked.join(',')}]`);
+  // 街上标志名(预生成在加载后 5 秒,此刻套件已跑到这里,五家都该亮着):
+  // 每家 11 格 = 门头大招牌背板+两面字、竖刀牌背板+两面字、屋顶灯牌背板+两面字、底座、门口光圈。
+  const marks = (await g()).shopMark;
+  check('五家店街上招牌齐全:每家 ≥10 格(大招牌/刀牌/屋顶灯箱/光圈)',
+    marks.length === 5 && marks.every((m) => m.n >= 10), marks.map((m) => `${m.name}:${m.n}`).join(' '));
   const d0 = doors[0];
   await page.evaluate(([x, z]) => window.__gta.footAt(x, z), [d0.x + d0.nx * 1.4, d0.z + d0.nz * 1.4]);
   await sleep(S(500));
@@ -748,6 +753,10 @@ await page.screenshot({ path: import.meta.dirname + '/shots/w1-peds.png' });
     && Math.abs(cam1.x) < room.w / 2 + 0.4 && Math.abs(cam1.z) < room.d / 2 + 0.4
     && cam1.y > 0.5 && cam1.y < room.h - 0.4,
     `inShop=${gIn.inShop} 人=(${gIn.x},${gIn.z}) 屋=${room && room.w}×${room && room.d} 障碍 ${solidB}→${gIn.solidCount} 相机=(${cam1.x},${cam1.y},${cam1.z})`);
+  // 精致化断言:屋里不是空壳 —— 陈设带贴图、屋里两盏灯点亮、家具碰撞盒全挂上(穿模修复的账)
+  check('屋内够精致:陈设有贴图、双灯点亮、家具碰撞盒 ≥10',
+    gIn.shopDecor.tex >= 6 && gIn.shopLight >= 6 && gIn.shopProps >= 10,
+    `贴图网格=${gIn.shopDecor.tex} 灯总强度=${gIn.shopLight} 店内盒=${gIn.shopProps}`);
   await page.screenshot({ path: import.meta.dirname + '/shots/w2-shop-inside.png' });
   // 四个方向各从屋子正中走 1.2 仿真秒:最远也只能贴到墙,穿不出屋(店内 pushOut 已整套换成屋里盒)
   let maxAx = 0, maxAz = 0;
@@ -760,6 +769,12 @@ await page.screenshot({ path: import.meta.dirname + '/shots/w1-peds.png' });
   }
   check('屋内四向推进都穿不出墙', maxAx <= room.w / 2 + 0.2 && maxAz <= room.d / 2 + 0.2,
     `最远 (${maxAx.toFixed(1)},${maxAz.toFixed(1)}) 半屋 ${(room.w / 2).toFixed(1)}×${(room.d / 2).toFixed(1)}`);
+  // 相机防穿模:回屋心站定,让相机阻尼收敛到位后,机位不许埋进任何"上半身高过相机"的家具盒
+  await page.evaluate(() => window.__gta.footAt(0, 0));
+  await sleep(S(1500));
+  const gCam = await g();
+  check('屋中心机位不怼家具:相机沿人-机位连线让位后 0 盒挡', gCam.shopCamBlock === 0,
+    `怼进 ${gCam.shopCamBlock} 个盒 机位=(${gCam.camEye.x},${gCam.camEye.y},${gCam.camEye.z})`);
   await page.keyboard.press('e');   // 出门
   await sleep(S(500));
   const gOut = await g();
@@ -767,6 +782,11 @@ await page.screenshot({ path: import.meta.dirname + '/shots/w1-peds.png' });
   check('再按 E 出门:回自家门前(世界坐标)、碰撞盒整段摘净',
     gOut.inShop === null && distDoor > 0.5 && distDoor < 4.5 && gOut.solidCount === solidB,
     `inShop=${gOut.inShop} 离门 ${distDoor.toFixed(1)} 米 障碍 ${solidB}→${gOut.solidCount}`);
+  // 出门还原:屋里灯/陈设贴图/碰撞盒/相机让位全归零(不然街上被屋里灯光洗亮),街上招牌不受进出影响
+  check('出门屋里全清零、街上招牌不受进出影响',
+    gOut.shopLight === 0 && gOut.shopDecor.tex === 0 && gOut.shopProps === 0 && gOut.shopCamBlock === 0
+    && gOut.shopMark.every((m) => m.n >= 10),
+    `灯=${gOut.shopLight} 贴图=${gOut.shopDecor.tex} 店内盒=${gOut.shopProps} 怼盒=${gOut.shopCamBlock}`);
 }
 
 // 步行特写:看小人还是不是"老头"

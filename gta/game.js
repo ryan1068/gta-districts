@@ -73,6 +73,14 @@ sun.shadow.mapSize.set(2048, 2048);
 Object.assign(sun.shadow.camera, { left: -62, right: 62, top: 62, bottom: -62, near: 1, far: 220 });
 scene.add(sun, sun.target);
 
+// 店内两盏"灯泡":场景级挂着,开局就在(强度 0),进店点亮、出门灭掉。
+// 用"增删灯"会害得所有材质每进一次店重编译一次着色器,所以只调强度不调存在。
+// 离街最近的一块街区也在 30 米外,distance 卡 20 米 —— 对街景绝对零影响。
+const shopLightA = new THREE.PointLight(0xffffff, 0, 20, 1.55);
+const shopLightB = new THREE.PointLight(0xffffff, 0, 20, 1.55);
+shopLightA.castShadow = false; shopLightB.castShadow = false;
+scene.add(shopLightA, shopLightB);
+
 // ══ 城市 ══
 const ground = new THREE.Mesh(new THREE.PlaneGeometry(HALF * 2 + 200, HALF * 2 + 200),
   new THREE.MeshStandardMaterial({ map: roadTex(), roughness: 0.95 }));   // 沥青
@@ -121,6 +129,8 @@ const blockIdx = (gx, gz) => blockTypes[gz * GRID + gx];
 // ════════════════════════════════════════════════════════════
 
 const unitBox = new THREE.BoxGeometry(1, 1, 1);
+const unitPlane = new THREE.PlaneGeometry(1, 1);   // 地面/天花/海报:平面才谈得上按米平铺贴图
+const unitSph = new THREE.SphereGeometry(1, 12, 10);
 const dummy = new THREE.Object3D();
 const tmpColor = new THREE.Color();
 
@@ -468,14 +478,16 @@ clutter(new THREE.CylinderGeometry(0.5, 0.5, 1, 6),
 //  · 门开在离最近马路那一面的墙上,门前 1.4 米必须站得住(probeSolid 干净),
 //    不行退试次近的一面,两面都不行这块地就换下一家;
 //  · 洗牌在这里消耗 rng —— 老种子的车流/行人位置会变,楼群不变(rng 流从这段才分叉)。
-// 室内不在这建:第一次进哪家才现建哪家(buildShop),屋子坐落世界原点,
+// 室内不在这建:加载 5 秒后五店一次预制(shopgen 末尾的 setTimeout);赶在前头进店则现建现进。屋子坐落世界原点,
 // 靠一圈 BackSide 黑壳把街上的一切挡在屋外,见 buildShop 里的注释。
+// lamp = 屋里那两盏灯的灯泡色(进店点亮):面馆暖、超市冷白、车间最白、诊所惨白、电玩压紫。
+// 面馆/超市/诊所的地面是"贴了膜"的(粗糙度低反光强),所以地面材质也会更亮更平。
 const SHOP_KINDS = [
-  { name: '老张面馆', glow: 0xff7043, floor: 0x8a6f52 },
-  { name: '街口超市', glow: 0x53a6ff, floor: 0x8d8f96 },
-  { name: '修车铺',   glow: 0xffc24a, floor: 0x6e737a },
-  { name: '社区诊所', glow: 0x4fd17c, floor: 0x9fa79f },
-  { name: '电玩厅',   glow: 0xb06bff, floor: 0x565064 },
+  { name: '老张面馆', glow: 0xff7043, floor: 0x8a6f52, lamp: 0xffcf9a },
+  { name: '街口超市', glow: 0x53a6ff, floor: 0x8d8f96, lamp: 0xeaf2ff },
+  { name: '修车铺',   glow: 0xffc24a, floor: 0x6e737a, lamp: 0xdfe9f4 },
+  { name: '社区诊所', glow: 0x4fd17c, floor: 0x9fa79f, lamp: 0xf0fff2 },
+  { name: '电玩厅',   glow: 0xb06bff, floor: 0x565064, lamp: 0xbf9aff },
 ];
 const shops = [];
 {
@@ -532,6 +544,11 @@ const shops = [];
     }
   }
 }
+// 加载 5 秒后把五家店连屋里街上招牌一次预制好:不然第一次进哪家,哪家就当场画贴图拼家具
+// —— 实测门口卡 2-5 秒;街上招牌也全靠这一手:没预制的店根本没招牌,"很难找"白修。
+// buildShop 一颗 rng 都不消耗(贴图噪点全走 Math.random),预生成不会把车流行人当场重排。
+// enterShop 里按需建屋仍是兜底:万一玩家 5 秒内就怼到门口,兜底照样接住。
+setTimeout(() => { for (const s2 of shops) if (!s2.built) buildShop(s2); }, 5000);
 
 // ── 车型:五种俯视轮廓互不相同的车 ──
 // 同类共用一套实例化几何,所以开销跟着"种类"涨、不跟着"数量"涨。
@@ -1473,16 +1490,327 @@ function pushOut(x, z, r) {              // 推出所有重叠实体,返回修�
 // 人进屋后 px/pz 直接当屋内坐标用(屋子坐落世界原点,px 本来就直接喂 man.position ——
 // 一套坐标三方共用:物理、人物、相机)。屋外的城市在屋里不参与物理(pushOut 的 interior
 // 过滤),所以原点那块地上的楼不会在店里立隐形墙。
+// ── 店内贴图:canvas 手画,五种店各有各的"脸" ──
+// 规矩:① 噪点全用 Math.random、绝不碰 rng() —— buildShop 要么加载 5 秒后预生成、要么
+//   第一次进店当场跑,两头都在玩的中途:它要是消耗 rng,车流行人就当场重排一次;
+// ② canvas 画一次就缓存,建屋时只 canvasTexture 套一次换 repeat,不重画像素。
+function txt2d(g, str, x, y, size, color, weight = '600') {   // 店内文字统一走这个字体
+  g.fillStyle = color;
+  g.font = `${weight} ${size}px "PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif`;
+  g.fillText(str, x, y);
+}
+const hexOf = (h) => '#' + h.toString(16).padStart(6, '0');
+function shopFloorCv(k) {
+  return (shopFloorCv.c || (shopFloorCv.c = []))[k] || (shopFloorCv.c[k] = makeCanvas(256, 256, (g) => {
+    if (k === 0) {                                            // 面馆:暖色木地板,板板有色差、带木纹错缝
+      g.fillStyle = '#7c5f45'; g.fillRect(0, 0, 256, 256);
+      for (let y = 0; y < 256; y += 32) {
+        const v = 0.8 + Math.random() * 0.4;
+        g.fillStyle = `rgb(${132 * v | 0},${101 * v | 0},${73 * v | 0})`;
+        g.fillRect(0, y, 256, 31);
+        g.fillStyle = 'rgba(0,0,0,.34)'; g.fillRect(0, y + 31, 256, 1);
+        g.fillStyle = 'rgba(0,0,0,.26)'; g.fillRect((y / 32) % 2 ? 88 : 200, y, 2, 31);   // 板缝错开
+        g.strokeStyle = 'rgba(80,55,32,.20)'; g.lineWidth = 1;
+        for (let i = 0; i < 3; i++) {                          // 每板几条长木纹
+          g.beginPath();
+          g.moveTo(0, y + 4 + Math.random() * 24);
+          g.bezierCurveTo(80, y + Math.random() * 32, 160, y + Math.random() * 32, 256, y + 4 + Math.random() * 24);
+          g.stroke();
+        }
+      }
+      // 大色块脏痕:1 像素板缝经不起 mip —— 三米开外被平均成一潭死色,只剩 2.4 米大缝成网格。
+      // 远看也要像木地板,就得给贴图备足"放大几倍还活着"的中频花纹,不能光靠细线。
+      for (let i = 0; i < 7; i++) {
+        g.fillStyle = `rgba(${Math.random() < 0.5 ? '70,48,28' : '196,160,116'},.12)`;
+        g.fillRect(Math.random() * 180, Math.random() * 200, 46 + Math.random() * 90, 20 + Math.random() * 44);
+      }
+      g.strokeStyle = 'rgba(50,34,18,.42)'; g.lineWidth = 2;
+      for (let i = 0; i < 3; i++) {                            // 两条横向伸缩缝(横跨整板,远距离还看得见)
+        const y = 30 + Math.random() * 196;
+        g.beginPath(); g.moveTo(0, y); g.lineTo(256, y + (Math.random() * 6 - 3)); g.stroke();
+      }
+    } else if (k === 1) {                                     // 超市:亮地砖 + 反光带
+      g.fillStyle = '#b9bcc2'; g.fillRect(0, 0, 256, 256);
+      for (let yy = 0; yy < 256; yy += 64) for (let xx = 0; xx < 256; xx += 64) {
+        const v = 0.9 + Math.random() * 0.16;
+        g.fillStyle = `rgb(${201 * v | 0},${203 * v | 0},${208 * v | 0})`;
+        g.fillRect(xx + 2, yy + 2, 60, 60);
+        g.fillStyle = 'rgba(255,255,255,.10)'; g.fillRect(xx + 2, yy + 2, 60, 8);
+      }
+      g.fillStyle = 'rgba(255,255,255,.05)';
+      for (let i = 0; i < 3; i++) g.fillRect(Math.random() * 210, 0, 16, 256);   // 斜反光
+    } else if (k === 2) {                                     // 修车铺:水泥地,油渍裂纹
+      g.fillStyle = '#6b6e73'; g.fillRect(0, 0, 256, 256);
+      for (let i = 0; i < 1800; i++) {
+        g.fillStyle = `rgba(${Math.random() < 0.5 ? '255,255,255' : '0,0,0'},${(Math.random() * 0.10).toFixed(3)})`;
+        g.fillRect(Math.random() * 256, Math.random() * 256, 2, 2);
+      }
+      for (let i = 0; i < 3; i++) {                            // 陈年油渍
+        const ox = Math.random() * 200, oy = Math.random() * 200;
+        g.fillStyle = 'rgba(20,18,16,.30)';
+        g.beginPath(); g.ellipse(ox + 28, oy + 28, 20 + Math.random() * 16, 13 + Math.random() * 10, Math.random(), 0, 7); g.fill();
+      }
+      g.strokeStyle = 'rgba(0,0,0,.18)'; g.lineWidth = 1.5;    // 一条裂缝
+      g.beginPath(); g.moveTo(20, 200); g.lineTo(70, 180); g.lineTo(120, 205); g.lineTo(190, 175); g.stroke();
+    } else if (k === 3) {                                     // 诊所:干净得发亮的白瓷砖
+      g.fillStyle = '#aeb6ae'; g.fillRect(0, 0, 256, 256);
+      for (let yy = 0; yy < 256; yy += 64) for (let xx = 0; xx < 256; xx += 64) {
+        const v = 0.92 + Math.random() * 0.10;
+        g.fillStyle = `rgb(${214 * v | 0},${224 * v | 0},${218 * v | 0})`;
+        g.fillRect(xx + 2, yy + 2, 60, 60);
+      }
+      for (let i = 0; i < 5; i++) {                            // 大片亮脏痕(mip 后才看得出不是纯色)
+        g.fillStyle = `rgba(${Math.random() < 0.5 ? '150,170,155' : '255,255,255'},.10)`;
+        g.fillRect(Math.random() * 170, Math.random() * 170, 50 + Math.random() * 80, 50 + Math.random() * 80);
+      }
+      g.fillStyle = 'rgba(40,90,70,.05)'; g.fillRect(0, 0, 256, 256);   // 一抹卫生绿
+    } else {                                                  // 电玩厅:深色地毯撒霓虹碎点
+      g.fillStyle = '#3a3346'; g.fillRect(0, 0, 256, 256);
+      for (let i = 0; i < 2400; i++) {
+        g.fillStyle = `rgba(${Math.random() < 0.5 ? '255,255,255' : '0,0,0'},${(Math.random() * 0.07).toFixed(3)})`;
+        g.fillRect(Math.random() * 256, Math.random() * 256, 2, 1);
+      }
+      const cs = ['176,107,255', '90,220,255', '255,110,140'];
+      for (let i = 0; i < 40; i++) {                          // 霓虹落地反光的色斑
+        g.fillStyle = `rgba(${cs[i % 3]},.06)`;
+        g.fillRect(Math.random() * 240, Math.random() * 240, 8 + Math.random() * 14, 4 + Math.random() * 6);
+      }
+    }
+  }));
+}
+function shopWallCv(k) {
+  return (shopWallCv.c || (shopWallCv.c = []))[k] || (shopWallCv.c[k] = makeCanvas(128, 128, (g) => {
+    g.fillStyle = ['#d6cbb8', '#ccd0d4', '#bcb4a4', '#d5ded6', '#6e6480'][k];
+    g.fillRect(0, 0, 128, 128);
+    const grd = g.createLinearGradient(0, 0, 0, 128);         // 近顶一圈积灰渐变
+    grd.addColorStop(0, 'rgba(0,0,0,.13)'); grd.addColorStop(0.3, 'rgba(0,0,0,0)');
+    grd.addColorStop(1, 'rgba(0,0,0,.04)');
+    g.fillStyle = grd; g.fillRect(0, 0, 128, 128);
+    for (let i = 0; i < 700; i++) {
+      g.fillStyle = `rgba(${Math.random() < 0.5 ? '255,255,255' : '0,0,0'},${(Math.random() * 0.05).toFixed(3)})`;
+      g.fillRect(Math.random() * 128, Math.random() * 128, 2, 1);
+    }
+    g.strokeStyle = 'rgba(0,0,0,.05)'; g.lineWidth = 2;       // 几道蹭痕
+    for (let i = 0; i < 3; i++) { g.beginPath(); g.arc(Math.random() * 128, 30 + Math.random() * 90, 8 + Math.random() * 14, 2.4, 5.4); g.stroke(); }
+  }));
+}
+function signCv(name, sub, glowHex) {                        // 门头灯箱:暗板 + 双圈霓虹 + 大字店名
+  return (signCv.c || (signCv.c = []))[name] || (signCv.c[name] = makeCanvas(512, 128, (g) => {
+    g.fillStyle = '#14171f'; g.fillRect(0, 0, 512, 128);
+    for (let i = 0; i < 500; i++) {
+      g.fillStyle = `rgba(255,255,255,${(Math.random() * 0.03).toFixed(3)})`;
+      g.fillRect(Math.random() * 512, Math.random() * 128, 2, 1);
+    }
+    const gc = hexOf(glowHex);
+    g.strokeStyle = gc;                                      // 宽铺底 + 细亮线,像霓虹
+    for (const [lw, al] of [[14, 0.22], [5, 0.95]]) { g.globalAlpha = al; g.lineWidth = lw; g.strokeRect(7, 7, 498, 114); }
+    g.globalAlpha = 1;
+    g.textAlign = 'center';
+    txt2d(g, name, 256, 72, 54, '#ffffff', '700');
+    txt2d(g, sub, 256, 106, 22, gc, '400');
+    g.textAlign = 'left';
+  }));
+}
+function bladeCv(name, glowHex) {                            // 侧挑刀牌:竖排店名,沿街两头都能瞄见
+  return (bladeCv.c || (bladeCv.c = []))[name] || (bladeCv.c[name] = makeCanvas(128, 512, (g) => {
+    g.fillStyle = '#14171f'; g.fillRect(0, 0, 128, 512);
+    const gc = hexOf(glowHex);
+    for (const [lw, al] of [[12, 0.22], [4, 0.95]]) { g.globalAlpha = al; g.lineWidth = lw; g.strokeRect(6, 6, 116, 500); }
+    g.globalAlpha = 1;
+    g.textAlign = 'center';
+    const step = 460 / Math.max(1, name.length), fs = Math.min(84, step * 0.8);
+    for (let i = 0; i < name.length; i++) txt2d(g, name[i], 64, 52 + step * (i + 0.78), fs, '#ffffff', '700');
+    g.textAlign = 'left';
+  }));
+}
+function ringCv() {                                           // 门口光圈:透明底亮环(贴地,店色),脚下最后确认
+  return (ringCv.c || (ringCv.c = makeCanvas(256, 256, (g) => {
+    const gr = g.createRadialGradient(128, 128, 20, 128, 128, 126);
+    gr.addColorStop(0, 'rgba(255,255,255,0)');
+    gr.addColorStop(0.7, 'rgba(255,255,255,0)');
+    gr.addColorStop(0.85, 'rgba(255,255,255,0.95)');
+    gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, 256, 256);
+  })));
+}
+function menuCv() {                                          // 面馆手写菜单板(粉笔画 + 木框)
+  return (menuCv.c || (menuCv.c = makeCanvas(512, 320, (g) => {
+    g.fillStyle = '#241c13'; g.fillRect(0, 0, 512, 320);
+    for (let i = 0; i < 900; i++) {
+      g.fillStyle = `rgba(255,240,210,${(Math.random() * 0.035).toFixed(3)})`;
+      g.fillRect(Math.random() * 512, Math.random() * 320, 2, 2);
+    }
+    g.strokeStyle = '#7a5230'; g.lineWidth = 14; g.strokeRect(7, 7, 498, 306);
+    g.textAlign = 'center'; txt2d(g, '面馆菜单', 256, 62, 48, '#ffd9a0', '700');
+    g.textAlign = 'left';
+    g.fillStyle = 'rgba(255,217,160,.4)'; g.fillRect(80, 80, 352, 3);
+    const dishes = [['牛肉面', '14'], ['炸酱面', '12'], ['酸辣粉', '9'], ['馄饨', '10'], ['现磨豆浆', '3']];
+    for (let i = 0; i < dishes.length; i++) {
+      const [dish, price] = dishes[i], y = 134 + i * 38;
+      txt2d(g, dish, 56, y, 28, '#f2e8d5');
+      g.fillStyle = 'rgba(242,232,213,.35)';                 // 菜名和价之间的引线点
+      for (let dx = 56 + dish.length * 30 + 12; dx < 404; dx += 14) g.fillRect(dx, y - 10, 3, 3);
+      txt2d(g, price, 430, y, 28, '#ffb46b', '700');
+      txt2d(g, '元', 462, y, 18, 'rgba(255,180,107,.75)');
+    }
+  })));
+}
+function posterCv(k, glowHex) {                              // 墙上招贴,一店一个主题
+  return (posterCv.c || (posterCv.c = []))[k] || (posterCv.c[k] = makeCanvas(256, 340, (g) => {
+    const gc = hexOf(glowHex);
+    g.textAlign = 'center';
+    if (k === 0) {                                           // 面馆:大海碗 +  chopsticks
+      g.fillStyle = '#3a2519'; g.fillRect(0, 0, 256, 340);
+      txt2d(g, '现擀手工面', 128, 60, 38, '#ffd9a0', '700');
+      g.strokeStyle = '#d8b070'; g.lineWidth = 6;
+      g.beginPath(); g.moveTo(58, 148); g.lineTo(196, 176); g.stroke();     // chopsticks
+      g.fillStyle = '#f4efe2'; g.beginPath(); g.ellipse(128, 208, 84, 32, 0, 0, 7); g.fill();
+      g.fillStyle = '#c94f3d'; g.beginPath(); g.ellipse(128, 202, 62, 20, 0, 0, 7); g.fill();
+      g.strokeStyle = '#f8e8c8'; g.lineWidth = 4;
+      for (let i = 0; i < 4; i++) { g.beginPath(); g.moveTo(78 + i * 10, 196); g.quadraticCurveTo(104 + i * 10, 172, 130 + i * 12, 190); g.stroke(); }
+      g.fillStyle = '#f4efe2'; g.beginPath(); g.ellipse(112, 262, 34, 12, 0, 0, 7); g.fill();   // 一碟蒜
+      g.fillStyle = gc; g.fillRect(0, 306, 256, 34);
+      txt2d(g, '免费加面 · 加辣', 128, 330, 26, '#20140c', '700');
+    } else if (k === 1) {                                    // 超市:黄底大红特价 + 价签条码
+      g.fillStyle = '#f2c53d'; g.fillRect(0, 0, 256, 340);
+      txt2d(g, '特价', 128, 150, 108, '#d43a2f', '800');
+      txt2d(g, '每晚八点后', 128, 210, 34, '#3a2c10', '600');
+      g.fillStyle = '#fff'; g.fillRect(28, 236, 200, 76);
+      g.fillStyle = '#1c2026';
+      for (let i = 0; i < 14; i++) g.fillRect(40 + i * 13, 246, (i % 3) + 3, 46);   // 条码
+      txt2d(g, '¥', 52, 304, 20, '#d43a2f', '800');
+    } else if (k === 2) {                                    // 修车铺:轮胎海报
+      g.fillStyle = '#26292e'; g.fillRect(0, 0, 256, 340);
+      g.strokeStyle = '#14161a'; g.lineWidth = 30;
+      g.beginPath(); g.arc(128, 176, 62, 0, 7); g.stroke();  // 胎体
+      g.strokeStyle = '#8d939b'; g.lineWidth = 10;
+      g.beginPath(); g.arc(128, 176, 30, 0, 7); g.stroke();  // 轮毂
+      for (let i = 0; i < 12; i++) {                         // 胎花纹一圈
+        const a = i / 12 * Math.PI * 2;
+        g.strokeStyle = '#3a3f45'; g.lineWidth = 6;
+        g.beginPath(); g.moveTo(128 + Math.cos(a) * 46, 176 + Math.sin(a) * 46); g.lineTo(128 + Math.cos(a) * 78, 176 + Math.sin(a) * 78); g.stroke();
+      }
+      txt2d(g, '换胎 · 补胎 · 做动平衡', 128, 314, 26, gc, '700');
+    } else if (k === 3) {                                    // 诊所:绿十字 + 体检招贴
+      g.fillStyle = '#eef4ef'; g.fillRect(0, 0, 256, 340);
+      g.fillStyle = '#2f9e5f'; g.fillRect(100, 60, 56, 160); g.fillRect(48, 112, 160, 56);
+      txt2d(g, '社区体检', 128, 282, 34, '#28513c', '700');
+      txt2d(g, '每季度六折', 128, 322, 26, '#2f9e5f', '500');
+    } else {                                                 // 电玩厅:霓虹抓娃娃
+      g.fillStyle = '#16121f'; g.fillRect(0, 0, 256, 340);
+      g.textBaseline = 'top';                                // 重描五遍 = 霓虹辉光(canvas 没 shadowBlur 也不心疼)
+      for (let i = 4; i >= 1; i--) { g.globalAlpha = i === 1 ? 1 : 0.14; txt2d(g, '抓娃娃', 128, 60, 56, gc, '700'); }
+      g.globalAlpha = 1; g.textBaseline = 'alphabetic';
+      for (let i = 0; i < 7; i++) {                          // 玻璃柜里的娃娃球
+        g.fillStyle = ['#ff7b6b', '#7bd0ff', '#ffd166', '#b06bff'][i % 4];
+        g.beginPath(); g.arc(44 + (i % 4) * 56, 200 + ((i % 2) ? 34 : 0), 20, 0, 7); g.fill();
+      }
+      g.strokeStyle = 'rgba(255,255,255,.25)'; g.lineWidth = 2; g.strokeRect(20, 156, 216, 130);   // 柜体
+      g.fillStyle = gc; g.fillRect(0, 302, 256, 38);
+      txt2d(g, '两币一次 · 欢迎练习', 128, 330, 26, '#16121f', '700');
+      g.textAlign = 'left';
+    }
+  }));
+}
+function priceCv() {                                         // 货架价签条:一格一价(超市专用)
+  return (priceCv.c || (priceCv.c = makeCanvas(512, 40, (g) => {
+    g.fillStyle = '#fff'; g.fillRect(0, 0, 512, 40);
+    for (let i = 0; i < 16; i++) {
+      const x = i * 32;
+      g.fillStyle = ['rgba(212,58,47,.85)', 'rgba(60,120,210,.8)', 'rgba(40,150,80,.8)'][i % 3];
+      g.fillRect(x + 2, 4, 10, 10);
+      g.fillStyle = '#2a2e33';
+      txt2d(g, String(2 + (i * 7) % 40), x + 14, 14, 11, '#2a2e33');   // 价目
+      g.fillStyle = 'rgba(0,0,0,.5)';
+      g.fillRect(x + 14, 20, 14, 3);                                   // 品名占位
+      g.fillStyle = 'rgba(0,0,0,.18)'; g.fillRect(x + 30, 0, 2, 40);
+    }
+  })));
+}
+function fridgeCv() {                                        // 面馆冰柜门:冰晶 + 红字
+  return (fridgeCv.c || (fridgeCv.c = makeCanvas(256, 256, (g) => {
+    const grd = g.createLinearGradient(0, 0, 0, 256);
+    grd.addColorStop(0, '#e9f4f6'); grd.addColorStop(1, '#bcd4dc');
+    g.fillStyle = grd; g.fillRect(0, 0, 256, 256);
+    for (let i = 0; i < 10; i++) {                          // 霜花
+      g.strokeStyle = 'rgba(255,255,255,.55)'; g.lineWidth = 2;
+      const x = 24 + Math.random() * 208, y = 24 + Math.random() * 208, L = 10 + Math.random() * 10;
+      for (let a = 0; a < 6; a++) { const an = a / 6 * Math.PI * 2; g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(an) * L, y + Math.sin(an) * L); g.stroke(); }
+    }
+    g.textAlign = 'center';
+    txt2d(g, '冰镇', 128, 84, 64, '#d43a2f', '700');
+    txt2d(g, '瓶装饮料 · 啤酒', 128, 132, 30, '#2c5a66', '500');
+    g.textAlign = 'left';
+  })));
+}
+function deskSignCv(k) {                                     // 台面立牌:收银/维修接待/挂号/上分兑奖
+  return (deskSignCv.c || (deskSignCv.c = []))[k] || (deskSignCv.c[k] = makeCanvas(256, 128, (g) => {
+    g.fillStyle = '#181c24'; g.fillRect(0, 0, 256, 128);
+    g.strokeStyle = hexOf(SHOP_KINDS[k].glow); g.lineWidth = 4; g.strokeRect(8, 8, 240, 112);
+    g.textAlign = 'center';
+    const label = ['收银台', '收银 · 整点打折', '维修接待', '挂号 · 取药', '上分 · 兑奖'][k];
+    txt2d(g, label, 128, 78, label.length > 4 ? 40 : 56, '#ffffff', '700');
+    g.textAlign = 'left';
+  }));
+}
+function matCv() {                                           // 门口地垫
+  return (matCv.c || (matCv.c = makeCanvas(256, 128, (g) => {
+    g.fillStyle = '#31404f'; g.fillRect(0, 0, 256, 128);
+    g.fillStyle = '#3c4c5c';
+    for (let x = 0; x < 256; x += 16) g.fillRect(x, 0, 8, 128);
+    g.strokeStyle = '#6b7a88'; g.lineWidth = 6; g.strokeRect(5, 5, 246, 118);
+    g.textAlign = 'center'; txt2d(g, '进店大吉', 128, 76, 36, '#cfc7ba', '600'); g.textAlign = 'left';
+  })));
+}
+function pegCv() {                                           // 修车铺工具墙:洞洞板 + 挂着的扳手锤子
+  return (pegCv.c || (pegCv.c = makeCanvas(256, 192, (g) => {
+    g.fillStyle = '#a89f88'; g.fillRect(0, 0, 256, 192);
+    g.fillStyle = 'rgba(0,0,0,.30)';
+    for (let y = 12; y < 192; y += 16) for (let x = 12; x < 256; x += 16) { g.beginPath(); g.arc(x, y, 2.4, 0, 7); g.fill(); }
+    g.fillStyle = 'rgba(30,35,42,.8)';                      // 扳手:圆头 + 斜柄
+    g.beginPath(); g.arc(52, 52, 14, 0, 7); g.fill(); g.fillRect(58, 56, 6, 72);
+    g.fillStyle = 'rgba(160,60,45,.85)'; g.fillRect(118, 40, 34, 22); g.fillStyle = 'rgba(60,65,72,.85)'; g.fillRect(132, 62, 7, 74);   // 锤子
+    g.strokeStyle = 'rgba(40,90,140,.85)'; g.lineWidth = 6;             // 一卷胶带
+    g.beginPath(); g.arc(202, 74, 20, 0, 7); g.stroke();
+    g.strokeStyle = 'rgba(30,35,42,.6)'; g.lineWidth = 4;               // 两把螺丝刀
+    g.beginPath(); g.moveTo(92, 150); g.lineTo(140, 150); g.moveTo(92, 168); g.lineTo(150, 168); g.stroke();
+  })));
+}
+function clockCv() {                                         // 挂钟表盘
+  return (clockCv.c || (clockCv.c = makeCanvas(128, 128, (g) => {
+    g.fillStyle = '#f6f4ee'; g.beginPath(); g.arc(64, 64, 60, 0, 7); g.fill();
+    g.strokeStyle = '#2b2e33'; g.lineWidth = 5; g.beginPath(); g.arc(64, 64, 60, 0, 7); g.stroke();
+    for (let i = 0; i < 12; i++) {                          // 时刻刻度,整点加粗
+      const a = i / 12 * Math.PI * 2;
+      g.strokeStyle = '#33363c'; g.lineWidth = i % 3 ? 3 : 6;
+      g.beginPath(); g.moveTo(64 + Math.cos(a) * 52, 64 + Math.sin(a) * 52); g.lineTo(64 + Math.cos(a) * 42, 64 + Math.sin(a) * 42); g.stroke();
+    }
+    g.strokeStyle = '#1c1e22'; g.lineWidth = 5;            // 固定指向七点五十五(快要点货 / 快打烊)
+    g.beginPath(); g.moveTo(64, 64); g.lineTo(52, 34); g.stroke();     // 分针差五分钟到八点
+    g.strokeStyle = '#b0432f'; g.lineWidth = 2; g.beginPath(); g.moveTo(64, 64); g.lineTo(64, 96); g.stroke();
+    g.fillStyle = '#1c1e22'; g.beginPath(); g.arc(64, 64, 5, 0, 7); g.fill();
+  })));
+}
+const SHOP_SUB = ['现炒浇头 · 免费加面', '24 小时 · 烟酒饮料', '保养 · 钣金 · 快速补胎', '内科 · 挂号 · 取药', '投币娱乐 · 抓娃娃'];
+
 function buildShop(s) {
   const g = new THREE.Group();
   const w = s.b.w - 1.0, d = s.b.d - 1.0, ht = 3.1, th = 0.3;   // 室内净尺寸:四面墙吃掉 1 米见方
   s.room = { w, d, h: ht };
+  const k = s.i % SHOP_KINDS.length;
   const glow = new THREE.MeshBasicMaterial({ color: s.K.glow, toneMapped: false });
   const warm = new THREE.MeshBasicMaterial({ color: 0xffe9c4, toneMapped: false });
-  const floorM = new THREE.MeshStandardMaterial({ color: s.K.floor, roughness: 0.85 });
-  const wallM = new THREE.MeshStandardMaterial({ color: 0xd4cec2, roughness: 0.92 });
-  const ceilM = new THREE.MeshStandardMaterial({ color: 0xb3aca0, roughness: 0.95 });
-  const std = (c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.8 });
+  const scr = (hex) => new THREE.MeshBasicMaterial({ color: hex, toneMapped: false, roughness: 0.3 });   // 屏幕:自己发光,不受灯管脸色摆布
+  const mapM = (cv, rx, ry, extra = {}) => new THREE.MeshStandardMaterial({ map: canvasTexture(cv, rx, ry), roughness: 0.9, ...extra });
+  // 地面/天花改用"面朝下/朝上的平面":单位盒贴图会被拉成一张全糊,平面才谈得上按米平铺。
+  const pane = (x, y, z, sw, sd, mat, flip) => {
+    const m = new THREE.Mesh(unitPlane, mat);
+    m.rotation.x = flip ? Math.PI / 2 : -Math.PI / 2;
+    m.position.set(x, y, z); m.scale.set(sw, sd, 1);          // rotateX 之后本地 y 就是世界 z 跨度
+    m.castShadow = false; m.receiveShadow = false; g.add(m);
+    return m;
+  };
+  pane(0, 0.01, 0, w + 2 * th, d + 2 * th, mapM(shopFloorCv(k), (w + 2 * th) / 2.4, (d + 2 * th) / 2.4, { roughness: k === 1 || k === 3 ? 0.35 : 0.8, metalness: k === 1 || k === 3 ? 0.15 : 0 }), false);
   const spec = [];
   const bx = (x, y, z, sw, sh, sd, mat, solid) => {
     const m = new THREE.Mesh(unitBox, mat);
@@ -1491,16 +1819,51 @@ function buildShop(s) {
     if (solid) spec.push({ x, z, hw: sw / 2, hd: sd / 2, h: sh });
     return m;
   };
-  bx(0, -0.07, 0, w + 2 * th, 0.14, d + 2 * th, floorM, false);
-  const wallX = (x) => bx(x, ht / 2, 0, th, ht, d + 2 * th, wallM, true);
-  const wallZ = (z) => bx(0, ht / 2, z, w + 2 * th, ht, th, wallM, true);
+  const panel = (x, y, z, sw, sh, mat, ry) => {               // 贴墙海报/立牌:一块单面平面
+    const m = new THREE.Mesh(unitPlane, mat);
+    m.position.set(x, y, z); m.scale.set(sw, sh, 1); m.rotation.y = ry || 0;
+    m.castShadow = false; m.receiveShadow = false; g.add(m);
+    return m;
+  };
+  // 圆柱家族:凳面、瓶罐、轮胎、盆栽、水管全靠它,屋里不再全是砖块感
+  const unitCyl = new THREE.CylinderGeometry(1, 1, 1, 14);
+  const unitCone = new THREE.CylinderGeometry(0.1, 1, 1, 12);
+  const unitTorus = new THREE.TorusGeometry(0.8, 0.2, 8, 16);
+  const cyl = (x, y, z, r, h, mat, open) => {
+    const m = new THREE.Mesh(open ? unitCone : unitCyl, mat);
+    m.position.set(x, y, z); m.scale.set(r, h, r);
+    m.castShadow = false; m.receiveShadow = false; g.add(m);
+    return m;
+  };
+  const plantAt = (x, z) => {                                // 陶盆 + 立柱 + 三层叶球
+    spec.push({ x, z, hw: 0.28, hd: 0.28, h: 0.5 });         // 盆也得撞:不推它人直接种进花盆里
+    cyl(x, 0.19, z, 0.22, 0.19, new THREE.MeshStandardMaterial({ color: 0x9c5b40, roughness: 0.8 }), false);
+    cyl(x, 0.42, z, 0.05, 0.3, new THREE.MeshStandardMaterial({ color: 0x5d7a3c, roughness: 0.8 }), false);
+    const leaf = new THREE.SphereGeometry(1, 10, 8), lm = new THREE.MeshStandardMaterial({ color: 0x3f8f4a, roughness: 0.9 });
+    for (const [ox, oy, oz, r] of [[0, 0.78, 0, 0.2], [-0.13, 0.66, 0.08, 0.14], [0.12, 0.68, -0.06, 0.15]]) {
+      const m = new THREE.Mesh(leaf, lm);
+      m.position.set(x + ox, oy, z + oz); m.scale.set(r, r * 0.85, r);
+      m.castShadow = false; m.receiveShadow = false; g.add(m);
+    }
+  };
+  const floorTile = k === 1 || k === 3;
+  const wallMs = [0, 1, 2, 3].map(() => mapM(shopWallCv(k), 1, 1));   // 四面墙各一份材质,repeat 按各自长高铺
+  const wain = new THREE.MeshStandardMaterial({ color: ['#6d5138', '#5f6b74', '#6a6252', '#7fa894', '#544a66'][k], roughness: 0.85 });
+  // 四面承重墙照旧(碰撞盒一颗没变),只是每面墙一份"按米平铺"的抹灰贴图 + 一圈深色踢裙
+  const wallX = (x) => { const m = bx(x, ht / 2, 0, th, ht, d + 2 * th, wallMs[x > 0 ? 0 : 1], true); m.material.map.repeat.set((d + 2 * th) / 3.2, ht / 3.2); };
+  const wallZ = (z) => { const m = bx(0, ht / 2, z, w + 2 * th, ht, th, wallMs[z > 0 ? 2 : 3], true); m.material.map.repeat.set((w + 2 * th) / 3.2, ht / 3.2); };
   wallX(w / 2 + th / 2); wallX(-(w / 2 + th / 2)); wallZ(d / 2 + th / 2); wallZ(-(d / 2 + th / 2));
-  bx(0, ht + 0.09, 0, w + 2 * th, 0.18, d + 2 * th, ceilM, false);
+  const ceilCv = makeCanvas(64, 64, (gg) => {               // 灰白矿棉板顶:每格 1.2 米,缝是深的
+    gg.fillStyle = '#cfc8ba'; gg.fillRect(0, 0, 64, 64);
+    for (let i = 0; i < 260; i++) { gg.fillStyle = `rgba(0,0,0,${(Math.random() * 0.06).toFixed(3)})`; gg.fillRect(Math.random() * 64, Math.random() * 64, 2, 2); }
+    gg.strokeStyle = 'rgba(0,0,0,.14)'; gg.lineWidth = 2; gg.strokeRect(1, 1, 62, 62);
+  });
+  pane(0, ht - 0.01, 0, w + 2 * th, d + 2 * th, mapM(ceilCv, (w + 2 * th) / 1.2, (d + 2 * th) / 1.2, { color: floorTile ? 0xe8e5de : 0xd8d0c2, roughness: 0.95 }), true);
   // 外黑壳:BackSide 的"里衬"盒 —— 店里看到的永远只有屋里:楼/树/人/车/地面全被这圈
   // 比屋子大 6 米的不透光盒子挡在墙外(店里只有一间房亮着这件事靠它兜底,不靠运气)。
   const shell = new THREE.Mesh(unitBox, new THREE.MeshBasicMaterial({ color: 0x12141a, side: THREE.BackSide }));
   shell.position.set(0, 3, 0); shell.scale.set(w + 2 * th + 6, 9.4, d + 2 * th + 6); g.add(shell);
-  // 门那一面:里侧发光门板(出门就靠它指路)+ 两扇亮窗给屋里"借"点街光
+  // 门那一面:里侧发光门板(出门就靠它指路)+ 两扇亮窗给屋里"借"点街光 + 门前地垫
   const fx = s.face.nx, fz = s.face.nz;
   const lx = fx ? fx * (w / 2 - 0.04) : s.t, lz = fx ? s.t : fz * (d / 2 - 0.04);
   bx(lx, 1.05, lz, fx ? 0.06 : 1.5, 2.1, fx ? 1.5 : 0.06, glow, false);
@@ -1508,38 +1871,224 @@ function buildShop(s) {
   for (const off of [span, -span]) {
     if (fx) bx(lx, 1.6, off, 0.05, 1.0, 2.0, glow, false); else bx(off, 1.6, lz, 2.0, 1.0, 0.05, glow, false);
   }
-  for (const off of [d * 0.22, -d * 0.22]) bx(0, ht - 0.04, off, 1.3, 0.05, 0.34, warm, false);   // 顶灯两条
-  // ── 陈设(按店种)── prop 是落地实盒:家具全进碰撞,推桌子推不动
-  const prop = (x, z, sw, sd, sh, c) => bx(x, sh / 2, z, sw, sh, sd, std(c), true);
-  const k = s.i % SHOP_KINDS.length;
-  if (k === 0) {                                    // 面馆:柜台 + 一桌四凳 + 后墙冰柜
+  const mx = fx ? fx * (w / 2 - 0.9) : s.t * 0.6, mz = fx ? s.t * 0.6 : fz * (d / 2 - 0.9);
+  pane(mx, 0.02, mz, 1.7, fx ? 1.1 : 1.7, mapM(matCv(), 1, 1), false);       // 地垫:踩上去就该听见"欢迎光临"
+  // 门头灯箱(屋内一侧,进门回头就认得门):暗板亮字,Basic 不受灯色摆布
+  const px1 = fx ? fx * (w / 2 - 0.1) : s.t * 0.92, pz1 = fx ? s.t * 0.92 : fz * (d / 2 - 0.1);
+  const rySign = fx ? (fx > 0 ? Math.PI : 0) : (fz > 0 ? -Math.PI / 2 : Math.PI / 2);   // 面朝屋里
+  panel(px1, 2.36, pz1, 2.2, 0.55, new THREE.MeshBasicMaterial({ map: canvasTexture(signCv(s.K.name, SHOP_SUB[k], s.K.glow), 1, 1, true), toneMapped: false }), rySign);
+  // 踢裙:四面各贴一条深色矮带 + 一道亮边,墙脚不再"墙直接怼地板"
+  const wainRun = (x, z, sx, sz) => {
+    bx(x, 0.42, z, sx, 0.84, sz, wain, false);
+    const cap = bx(x, 0.86, z, sx + 0.02, 0.04, sz + 0.02, wain.clone(), false);
+    cap.material.color.multiplyScalar(1.35);
+  };
+  wainRun(-(w / 2 + th - 0.05), 0, 0.1, d + 2 * th - 0.1); wainRun(w / 2 + th - 0.05, 0, 0.1, d + 2 * th - 0.1);
+  wainRun(0, -(d / 2 + th - 0.05), w + 2 * th - 0.1, 0.1); wainRun(0, d / 2 + th - 0.05, w + 2 * th - 0.1, 0.1);
+  // 挂钟在门对面那面墙 —— "店里有没有钟"是生活感的一半
+  const cwx = fx ? -fx * (w / 2 - 0.06) : 0, cwz = fx ? 0 : -fz * (d / 2 - 0.06);
+  const ryClock = fx ? (fx > 0 ? 0 : Math.PI) : (fz > 0 ? Math.PI / 2 : -Math.PI / 2);
+  panel(cwx, 2.2, cwz, 0.52, 0.52, mapM(clockCv(), 1, 1, { roughness: 0.6 }), ryClock);
+  // ── 陈设(按店种)── 家具落地照旧进碰撞;桌面摆件、瓶罐、货物全是"看得见推不着"的装饰
+  const prop = (x, z, sw, sd, sh, c) => bx(x, sh / 2, z, sw, sh, sd, new THREE.MeshStandardMaterial({ color: c, roughness: 0.8 }), true);
+  const deco = (x, y, z, sw, sh, sd, c) => bx(x, y, z, sw, sh, sd, new THREE.MeshStandardMaterial({ color: c, roughness: 0.75 }), false);
+  const goods = (x0, y0, z0, axis, span, pal) => {            // 一排小货物:盒+罐混着摆(装饰,不进碰撞)
+    let u = 0;
+    while (u < span - 0.12) {
+      const uu = x0 + (axis ? u : 0), vv = z0 + (axis ? 0 : u);
+      if (Math.random() < 0.6) deco(uu, y0 + 0.09, vv, 0.14, 0.18, 0.12, pal[(Math.random() * pal.length) | 0]);
+      else cyl(uu, y0 + 0.11, vv, 0.07, 0.22, new THREE.MeshStandardMaterial({ color: pal[(Math.random() * pal.length) | 0], roughness: 0.6 }), false);
+      u += 0.19 + Math.random() * 0.08;
+    }
+  };
+  s.lights = [];
+  if (k === 0) {                                             // 面馆:柜台+四圆凳+一桌+后墙冰柜+煮面锅台
     prop(-w * 0.24, -d * 0.18, 3.0, 0.9, 1.05, 0xb4875a);
-    prop(w * 0.16, d * 0.06, 1.5, 1.5, 0.75, 0xd8c9a8);
+    deco(-w * 0.24, 1.08, -d * 0.18, 3.06, 0.06, 0.96, 0x6d4c2c);   // 台面亮条
     for (const [ax, az] of [[0.72, 0], [-0.72, 0], [0, 0.72], [0, -0.72]]) prop(w * 0.16 + ax, d * 0.06 + az, 0.42, 0.42, 0.46, 0x8f5f3a);
-    prop(w * 0.32, -d * 0.3, 1.1, 1.1, 1.9, 0x9aa2a8);
-  } else if (k === 1) {                             // 超市:三排货架 + 门边收银台
-    for (const off of [-w * 0.28, 0, w * 0.28]) prop(off, -d * 0.1, 0.9, d * 0.55, 1.8, 0x7f8894);
+    prop(w * 0.16, d * 0.06, 1.5, 1.5, 0.75, 0xd8c9a8);
+    deco(w * 0.16, 0.78, d * 0.06, 1.5, 0.05, 1.5, 0xe8dcc0);   // 桌面(台面顶 1.11/桌面顶 0.80,摆件全按这个高度落脚)
+    for (const [ox, oz] of [[-0.35, -0.3], [0.3, 0.25]]) cyl(w * 0.16 + ox, 0.85, d * 0.06 + oz, 0.12, 0.07, new THREE.MeshStandardMaterial({ color: 0xf2ead6, roughness: 0.4 }), false);   // 两只碗
+    deco(w * 0.16 + 0.05, 0.9, d * 0.06 - 0.02, 0.3, 0.02, 0.03, 0xcbb27a);                                   // 搁碗上一双筷
+    deco(-w * 0.1, 1.26, -d * 0.18, 0.18, 0.3, 0.14, 0x8b3a2e);       // 辣椒罐
+    deco(-w * 0.02, 1.18, -d * 0.18, 0.22, 0.14, 0.16, 0xe0d6bd);    // 纸巾盒
+    deco(-w * 0.24, 1.21, -d * 0.18 - 0.2, 0.16, 0.2, 0.12, 0x3a6ea5);  // 酱油瓶
+    prop(w * 0.32, -d * 0.3, 1.1, 1.1, 1.9, 0x9aa2a8);        // 冰柜
+    panel(w * 0.32 + 0.57, 1.0, -d * 0.3, 1.0, 1.7, mapM(fridgeCv(), 1, 1, { roughness: 0.4, metalness: 0.2 }), -Math.PI / 2);   // 冰柜门贴正面、朝屋里
+    const bxk = w * 0.42, bzk = d * 0.08;
+    prop(bxk, bzk, 1.4, 1.0, 0.9, 0x8d959c);                  // 后墙煮面锅台
+    cyl(bxk - 0.28, 0.96, bzk, 0.2, 0.12, new THREE.MeshStandardMaterial({ color: 0xcfd4d8, roughness: 0.4, metalness: 0.5 }), false);   // 两口锅
+    cyl(bxk + 0.28, 0.96, bzk, 0.2, 0.12, new THREE.MeshStandardMaterial({ color: 0xcfd4d8, roughness: 0.4, metalness: 0.5 }), false);
+    panel(-w * 0.02, 1.9, -d / 2 + 0.05, 2.0, 1.25, mapM(menuCv(), 1, 1), 0);   // 菜单板钉在后墙正中
+    panel(w * 0.06, 1.7, -d / 2 + 0.04, 0.78, 1.0, mapM(posterCv(0, s.K.glow), 1, 1), 0);
+    s.lights = [{ x: w * 0.16, z: d * 0.06, i: 8 }, { x: -w * 0.24, z: -d * 0.18, i: 6 }];   // 强度是 PBR 定标的(见文件头两灯注释):实测 14/10 仍把木地板烤成一张白纸,再降一档
+    const l0 = s.lights[0];                                  // 头顶吊灯:锥罩+灯泡,正好吊在桌上方
+    // 吊高一档:屋里能跳(实测峰值头高 ~2.5),罩沿和灯泡都躲到头峰值以上,起跳才不穿灯
+    cyl(w * 0.16, 2.85, d * 0.06, 0.012, 0.24, new THREE.MeshStandardMaterial({ color: 0x26282c, roughness: 0.9 }), false);   // 电线
+    cyl(w * 0.16, 2.62, d * 0.06, 0.19, 0.2, new THREE.MeshStandardMaterial({ color: 0x2e2a26, roughness: 0.6, side: THREE.DoubleSide }), true);   // 锥罩(灯口朝下,沿口 2.52)
+    const bulb = new THREE.Mesh(unitSph, new THREE.MeshBasicMaterial({ color: 0xffdfae, toneMapped: false }));
+    bulb.position.set(w * 0.16, 2.52, d * 0.06); bulb.scale.set(0.07, 0.09, 0.07);
+    bulb.castShadow = false; bulb.receiveShadow = false; g.add(bulb);
+  } else if (k === 1) {                                      // 超市:三排货架(层板+满货+价签条)+ 收银台
+    const pal = [0xd9543f, 0xe8b13a, 0x3f9ed6, 0x49b06a, 0xd66fa8, 0x8b6fd6];
+    for (const off of [-w * 0.28, 0, w * 0.28]) {
+      spec.push({ x: off, z: -d * 0.1, hw: 0.45, hd: (d * 0.55) / 2, h: 1.8 });   // 碰撞盒一个不少,外观散件拼
+      deco(off, 0.9, -d * 0.1, 0.9, 1.8, 0.14, 0x565e68);     // 背板
+      deco(off, 0.9, -d * 0.1 + d * 0.275, 0.9, 1.8, 0.03, 0x4d545c);   // 前挡板(价签贴它)
+      for (const yy of [0.24, 0.68, 1.12, 1.56]) {
+        deco(off, yy, -d * 0.1, 0.88, 0.05, d * 0.54, 0x9aa2ac);        // 四层板
+        goods(off - 0.4, yy + 0.03, -d * 0.1 - d * 0.24, 0, d * 0.48, pal);   // 每层一排货
+      }
+      panel(off, 1.58, -d * 0.1 + d * 0.275 + 0.03, 0.86, 0.13, mapM(priceCv(), 1, 1), 0);   // 价签条
+    }
     prop(w * 0.2, d * 0.32, 1.3, 0.8, 0.95, 0x4a7fb5);
-  } else if (k === 2) {                             // 修车铺:举升台上一台没修完的车 + 工具箱
+    deco(w * 0.2, 1.0, d * 0.32, 1.36, 0.06, 0.86, 0x39688f);
+    bx(w * 0.2 - 0.3, 1.16, d * 0.32, 0.34, 0.26, 0.04, scr(0x6fd2ff), false);   // 小票机屏幕亮着
+    panel(w * 0.2 - 0.3, 1.16, d * 0.32 + 0.42, 0.5, 0.25, new THREE.MeshBasicMaterial({ map: canvasTexture(deskSignCv(1), 1, 1, true), toneMapped: false }), 0);   // 立牌立在台面前沿、朝客
+    goods(w * 0.2 - 0.5, 1.06, d * 0.32 + 0.3, 0, 1.0, pal);  // 收银台边随手一排放的商品
+    for (const zz of [0.4, -0.1, -0.6]) deco(-w * 0.44, 0.5, d * 0.18 + zz, 0.55, 1.0, 0.55, 0x39424e);   // 冷柜一溜
+    deco(-w * 0.44, 1.04, d * 0.18, 0.6, 0.08, 1.6, 0x9fb6c2);
+    spec.push({ x: -w * 0.44, z: d * 0.18 - 0.1, hw: 0.32, hd: 0.82, h: 1.05 });                            // 一溜柜拼一个长盒,够撞
+    prop(w * 0.42, -d * 0.4, 1.1, 0.8, 1.0, 0x7f8894);        // 门口纸箱堆
+    deco(w * 0.42 + 0.1, 1.25, -d * 0.4, 0.6, 0.5, 0.55, 0xb08a52);
+    panel(-w * 0.06, 1.7, d / 2 - 0.05, 0.78, 1.0, mapM(posterCv(1, s.K.glow), 1, 1), Math.PI);
+    s.lights = [{ x: 0, z: -d * 0.1, i: 9 }, { x: w * 0.2, z: d * 0.32, i: 6 }];
+    for (const zz of [-d * 0.35, d * 0.05]) {                 // 两条真灯管(发光条 + 灰壳),灯位就是光位
+      deco(0, ht - 0.14, zz, 3.2, 0.1, 0.22, 0x9aa0a8);
+      bx(0, ht - 0.22, zz, 3.0, 0.05, 0.12, warm, false);
+    }
+  } else if (k === 2) {                                      // 修车铺:车壳上四轮 + 胎堆 + 油桶 + 工具墙 + 工作灯
     prop(-w * 0.06, -d * 0.16, 3.0, 2.0, 0.3, 0x4a5058);
-    prop(-w * 0.06, -d * 0.16, 3.6, 1.7, 0.95, 0xc0504a);   // 车壳:一个实盒够撞,漆面高光靠两条哑光块凑
+    prop(-w * 0.06, -d * 0.16, 3.6, 1.7, 0.95, 0xc0504a);     // 车壳一个实盒够撞,外观拼散件
     prop(-w * 0.06, -d * 0.16, 1.8, 1.45, 0.5, 0x8a3b36);
-    prop(w * 0.3, d * 0.18, 1.0, 0.7, 1.1, 0xc94f3d);
+    for (const [wx, wz] of [[-1.3, -0.72], [1.3, -0.72], [-1.3, 0.72], [1.3, 0.72]]) {   // 四个轱辘(车在举升台上,轮悬在半空才像话)
+      const m = new THREE.Mesh(unitTorus, new THREE.MeshStandardMaterial({ color: 0x1c1e22, roughness: 0.9 }));
+      m.position.set(-w * 0.06 + wx, 0.55, -d * 0.16 + wz);
+      m.scale.set(0.42, 0.42, 0.42);                          // 默认 XY 面 = 轴向 ±z,正好是左右轮的立姿
+      m.castShadow = false; m.receiveShadow = false; g.add(m);
+      cyl(-w * 0.06 + wx, 0.55, -d * 0.16 + wz, 0.14, 0.3, new THREE.MeshStandardMaterial({ color: 0x8d939b, roughness: 0.4, metalness: 0.6 }), false);   // 轮毂
+    }
+    deco(-w * 0.06, 1.3, -d * 0.16, 1.6, 0.32, 1.5, 0x2a2d33);   // 车厢玻璃黑盒
+    deco(-w * 0.06 + 0.95, 1.5, -d * 0.16, 0.7, 0.1, 1.4, 0x8a3b36);   // 机盖支着
+    prop(w * 0.3, d * 0.18, 1.0, 0.7, 1.1, 0xc94f3d);         // 工具箱:抽屉一层层 + 亮把手
+    for (const yy of [0.24, 0.56, 0.88]) { deco(w * 0.3, yy, d * 0.18 + 0.36, 0.94, 0.28, 0.02, 0xb0432f); deco(w * 0.3, yy, d * 0.18 + 0.37, 0.5, 0.05, 0.02, 0xd8d4cc); }   // 三层抽屉 + 亮把手
+    cyl(w * 0.3 - 0.3, 1.24, d * 0.18 - 0.2, 0.09, 0.28, new THREE.MeshStandardMaterial({ color: 0x2a2d33, roughness: 0.5 }), false);   // 工具箱顶:扳手段 + 零件盘(箱面顶 1.1)
+    deco(w * 0.3 + 0.3, 1.16, d * 0.18 + 0.1, 0.3, 0.12, 0.2, 0x7c848d);
+    for (let i = 0; i < 3; i++) {                             // 胎堆三只(叠在角上)
+      const m = new THREE.Mesh(unitTorus, new THREE.MeshStandardMaterial({ color: 0x1c1e22, roughness: 0.95 }));
+      m.rotation.x = Math.PI / 2; m.position.set(w * 0.44, 0.26 + i * 0.24, -d * 0.42 + i * 0.05);
+      m.castShadow = false; m.receiveShadow = false; g.add(m);
+    }
+    spec.push({ x: w * 0.44, z: -d * 0.4, hw: 1.08, hd: 1.08, h: 0.98 });                                    // 胎是圆的,撞盒照旧方块(2 米外径的大家伙,不推人半个身子埋胎里)
+    cyl(-w * 0.44, 0.45, -d * 0.4 + 0.76, 0.28, 0.9, new THREE.MeshStandardMaterial({ color: 0x3a6ea5, roughness: 0.6 }), false);   // 油桶(让开举升台臂,落在台边的空地上)
+    spec.push({ x: -w * 0.44, z: -d * 0.4 + 0.76, hw: 0.3, hd: 0.3, h: 0.9 });
+    cyl(-w * 0.44, 0.92, -d * 0.4 + 0.76, 0.24, 0.05, new THREE.MeshStandardMaterial({ color: 0x2c5680, roughness: 0.6 }), false);
     prop(-w * 0.38, d * 0.3, 0.9, 0.9, 1.6, 0x5d6570);
-  } else if (k === 3) {                             // 诊所:前台 + 两条长椅 + 药柜
+    panel(-w * 0.38, 1.9, d / 2 - 0.05, 1.9, 1.4, mapM(pegCv(), 1, 1), Math.PI);   // 工具墙
+    panel(-w * 0.02, 1.7, d / 2 - 0.05, 0.78, 1.0, mapM(posterCv(2, s.K.glow), 1, 1), Math.PI);
+    bx(w * 0.3, 1.18, d * 0.18 + 0.05, 0.4, 0.16, 0.2, scr(s.K.glow), false);   // 工具箱顶一台检测平板亮着
+    plantAt(-w * 0.44, d * 0.02);
+    s.lights = [{ x: -w * 0.06, z: -d * 0.16, i: 12 }, { x: w * 0.3, z: d * 0.2, i: 5 }];
+    for (const zz of [-d * 0.16, d * 0.28]) {                 // 车间日光灯两条,冷白
+      deco(0, ht - 0.14, zz, 3.4, 0.12, 0.26, 0x3f444a);
+      bx(0, ht - 0.22, zz, 3.2, 0.05, 0.14, new THREE.MeshBasicMaterial({ color: 0xdfefff, toneMapped: false }), false);
+    }
+  } else if (k === 3) {                                      // 诊所:前台绿十字 + 长椅带腿扶手 + 玻璃药柜 + 饮水机
     prop(-w * 0.2, -d * 0.22, 2.4, 0.9, 1.0, 0xd9dee3);
-    prop(w * 0.12, d * 0.16, 1.8, 0.55, 0.5, 0x8d9aa5);
-    prop(w * 0.12, d * 0.38, 1.8, 0.55, 0.5, 0x8d9aa5);
-    prop(-w * 0.34, d * 0.28, 1.2, 0.5, 1.9, 0xe6ebe8);
-  } else {                                          // 电玩厅:沿墙四台机子(发光脸)+ 一桌
-    for (const off of [-w * 0.34, -w * 0.12, w * 0.12, w * 0.34]) prop(off, -d * 0.34, 1.0, 0.8, 1.7, 0x2e3340);
-    prop(-w * 0.34, -d * 0.34 + 0.43, 0.86, 0.05, 0.5, s.K.glow);   // 屏幕脸三块:Basic 不受光,黑柜里自己就是光源
-    prop(0, -d * 0.34 + 0.43, 0.86, 0.05, 0.5, s.K.glow);            // (四台的斜脸做不了:盒盒都是轴对齐的,三块已经够点亮屋子)
-    prop(w * 0.34, -d * 0.34 + 0.43, 0.86, 0.05, 0.5, s.K.glow);
+    deco(-w * 0.2, 1.03, -d * 0.22, 2.46, 0.06, 0.96, 0x5fae7e);
+    panel(-w * 0.2, 1.5, -d * 0.22 - 0.47, 0.7, 0.5, mapM(posterCv(3, s.K.glow), 1, 1, { roughness: 0.7 }), Math.PI);   // 绿十字嵌前台背面(进门正对的就是这一面)
+    panel(-w * 0.2 + 0.8, 1.34, -d * 0.22 + 0.47, 0.5, 0.25, new THREE.MeshBasicMaterial({ map: canvasTexture(deskSignCv(3), 1, 1, true), toneMapped: false }), 0);
+    bx(-w * 0.34, 1.18, -d * 0.22, 0.3, 0.22, 0.04, scr(0x9fe8ff), false);   // 电脑屏
+    deco(-w * 0.34, 1.0, -d * 0.22 + 0.2, 0.28, 0.16, 0.2, 0xb9c2c8);
+    for (const zz of [d * 0.16, d * 0.38]) {                  // 长椅:坐面 + 靠背 + 四腿 + 两边扶手
+      prop(w * 0.12, zz, 1.8, 0.55, 0.5, 0x8d9aa5);
+      deco(w * 0.12, 0.72, zz - 0.26, 1.8, 0.4, 0.06, 0x7e8b96);
+      for (const [ox, oz] of [[-0.8, -0.2], [0.8, -0.2], [-0.8, 0.2], [0.8, 0.2]]) deco(w * 0.12 + ox, 0.2, zz + oz, 0.06, 0.4, 0.06, 0x5c666f);
+      for (const ox of [-0.92, 0.92]) deco(w * 0.12 + ox, 0.56, zz, 0.05, 0.06, 0.5, 0x5c666f);
+    }
+    prop(-w * 0.34, d * 0.28, 1.2, 0.5, 1.9, 0xe6ebe8);       // 药柜:玻璃门 + 里面三层药盒
+    for (const yy of [0.5, 1.0, 1.5]) deco(-w * 0.34, yy, d * 0.28 + 0.1, 1.1, 0.3, 0.3, 0xf2f5f2);
+    bx(-w * 0.34, 1.1, d * 0.28 - 0.26, 1.15, 1.6, 0.03, new THREE.MeshStandardMaterial({ color: 0xbcd6de, roughness: 0.15, metalness: 0.3, transparent: true, opacity: 0.35 }), false);
+    prop(-w * 0.44, -d * 0.02, 0.5, 0.5, 1.1, 0xeef0f2);      // 饮水机
+    cyl(-w * 0.44, 1.35, -d * 0.02, 0.17, 0.4, new THREE.MeshStandardMaterial({ color: 0x7fbcd6, roughness: 0.15, metalness: 0.1, transparent: true, opacity: 0.5 }), false);   // 桶装水坐稳在机顶上
+    panel(w * 0.06, 1.7, -d / 2 + 0.05, 0.78, 1.0, mapM(posterCv(3, s.K.glow), 1, 1), 0);
+    panel(w * 0.3, 1.7, -d / 2 + 0.05, 0.78, 1.0, mapM(posterCv(1, s.K.glow), 1, 1), 0);   // 旁边蹭一张超市促销(社区公告栏既视感)
+    plantAt(w * 0.42, d * 0.36);
+    s.lights = [{ x: 0, z: 0, i: 10 }, { x: -w * 0.2, z: -d * 0.22, i: 6 }];
+    for (const zz of [-d * 0.3, d * 0.3]) {                   // 诊所必有的惨白灯盘
+      deco(0, ht - 0.12, zz, 1.8, 0.08, 0.9, 0xe8ece8);
+      bx(0, ht - 0.17, zz, 1.5, 0.04, 0.6, new THREE.MeshBasicMaterial({ color: 0xf2fff5, toneMapped: false }), false);
+    }
+  } else {                                                   // 电玩厅:四台机(发光屏+控制台)+霓虹楣灯+小桌沙发墩
+    for (const [off, on] of [[-w * 0.34, 1], [-w * 0.12, 0], [w * 0.12, 1], [w * 0.34, 1]]) {
+      prop(off, -d * 0.34, 1.0, 0.8, 1.7, 0x2e3340);
+      if (on) bx(off, 1.15, -d * 0.34 + 0.41, 0.8, 0.5, 0.05, scr(0x59b7ff), false);       // 屏:蓝为主,不靠它照明
+      deco(off, 0.88, -d * 0.34 + 0.5, 0.9, 0.1, 0.25, 0x3a4150);   // 控制台沿
+      cyl(off - 0.2, 1.0, -d * 0.34 + 0.46, 0.035, 0.16, new THREE.MeshStandardMaterial({ color: 0x1c1e22 }), false);      // 摇杆杆
+      cyl(off - 0.2, 1.1, -d * 0.34 + 0.46, 0.06, 0.05, new THREE.MeshStandardMaterial({ color: 0xd43a2f, roughness: 0.4 }), false);           // 红球头
+      for (const [bxx, i2] of [[0.1, 0x2f6f3f], [0.22, 0x2f6f3f], [0.16, 0x8a7f3f]]) deco(off + bxx, 0.94, -d * 0.34 + 0.44, 0.09, 0.03, 0.09, i2);   // 按键三连
+      bx(off, 1.72, -d * 0.34, 0.9, 0.06, 0.5, scr(s.K.glow), false);                      // 柜顶灯条
+    }
+    panel(0, 2.5, -d / 2 + 0.06, 3.6, 0.4, new THREE.MeshBasicMaterial({ map: canvasTexture(signCv('电玩玩家俱乐部', 'CREDIT 01 · 全城最高连击纪录就在这', s.K.glow), 1, 1, true), toneMapped: false }), 0);   // 霓虹楣灯
     prop(0, d * 0.2, 2.0, 1.2, 0.75, 0x3a4150);
+    deco(0, 0.78, d * 0.2, 2.06, 0.06, 1.26, 0x2b313d);
+    for (const ox of [-0.6, 0.6]) {
+      cyl(ox, 0.24, d * 0.2 + 1.0, 0.3, 0.36, new THREE.MeshStandardMaterial({ color: 0xb06bff, roughness: 0.9 }), false);   // 两只紫沙发墩
+      spec.push({ x: ox, z: d * 0.2 + 1.0, hw: 0.32, hd: 0.32, h: 0.4 });
+    }
+    deco(-0.3, 0.95, d * 0.2, 0.26, 0.14, 0.2, 0xe0d6bd);     // 桌上的兑奖罐
+    bx(-0.3, 1.08, d * 0.2, 0.2, 0.1, 0.16, new THREE.MeshStandardMaterial({ color: 0xd8d4cc, roughness: 0.3, metalness: 0.2 }), false);
+    panel(w / 2 - 0.05, 1.7, d * 0.08, 0.78, 1.0, mapM(posterCv(4, s.K.glow), 1, 1), -Math.PI / 2);
+    panel(w / 2 - 0.05, 1.7, -d * 0.16, 0.78, 1.0, mapM(posterCv(4, s.K.glow), 1, 1), -Math.PI / 2);
+    for (const zz of [-d * 0.34, d * 0.2]) bx(0, ht - 0.04, zz, 1.3, 0.05, 0.34, warm, false);   // 顶灯两条(老规矩留中低暖)
+    s.lights = [{ x: 0, z: -d * 0.34, i: 6 }, { x: 0, z: d * 0.2, i: 5 }];
   }
   s.solidSpecs = spec;
-  g.visible = false; scene.add(g);
+  // ── 街上标志(用户点名"很难找"):三层定位 —— 门头正对街的横招牌、招牌边沿挑出的竖刀牌
+  // (沿街两头各看得见一面)、屋顶灯牌(沿街远望认店色)、门口光圈(脚下最后确认)。
+  // 标志挂独立组、不进 s.group —— 那组只在进店时可见,招牌吊里面上街就看不见了。
+  // 招牌不进 solids:站在招牌底下不会被"标志"挡住。预生成跑完(加载+5 秒)全城五块招牌一起亮。
+  {
+    const b = s.b, dx = s.dx, dz = s.dz;
+    const tX = fx ? 0 : 1, tZ = fx ? 1 : 0;                 // 沿墙切线(门朝 ±x 时切线就是 z)
+    const glowT = new THREE.MeshBasicMaterial({ map: canvasTexture(signCv(s.K.name, SHOP_SUB[k], s.K.glow), 1, 1, true), toneMapped: false });
+    const glowB = new THREE.MeshBasicMaterial({ map: canvasTexture(bladeCv(s.K.name, s.K.glow), 1, 1, true), toneMapped: false });
+    const dark = new THREE.MeshStandardMaterial({ color: 0x23262e, roughness: 0.9 });
+    const mark = new THREE.Group();
+    const mm = (sx2, sy2, sz2, x, y, z, mat) => {
+      const m = new THREE.Mesh(unitBox, mat);
+      m.position.set(x, y, z); m.scale.set(sx2, sy2, sz2);
+      m.castShadow = false; m.receiveShadow = false; mark.add(m);
+    };
+    const plate = (x, y, z, wq, hq, mat, nx2, nz2, off) => {   // 一暗板两面亮字:正反面各一张,反面翻过去字才不镜像
+      const ry0 = Math.atan2(nx2, nz2);
+      for (const sgn of [1, -1]) {
+        const m = new THREE.Mesh(unitPlane, mat);
+        m.scale.set(wq, hq, 1); m.rotation.y = ry0 + (sgn > 0 ? 0 : Math.PI);
+        m.position.set(x + nx2 * off * sgn, y, z + nz2 * off * sgn);
+        m.castShadow = false; m.receiveShadow = false; mark.add(m);
+      }
+    };
+    const signW = Math.min(b.w * 0.55, 5.6), cy = Math.min(b.h - 0.75, 3.45);   // 招牌别宽过门脸、别高怼进女儿墙
+    const mx2 = dx + fx * 0.3, mz2 = dz + fz * 0.3;           // 离开墙皮 0.3 米:字面不吞影、板不嵌墙
+    mm(fx ? 0.16 : signW, 1.15, fx ? signW : 0.16, mx2, cy, mz2, dark);          // ① 门头横招牌
+    plate(mx2, cy, mz2, signW, 1.15, glowT, fx, fz, 0.1);
+    const blX = mx2 + tX * (signW / 2 + 0.3), blZ = mz2 + tZ * (signW / 2 + 0.3);
+    mm(fx ? 0.34 : 0.08, 1.36, fx ? 0.08 : 0.34, blX, cy - 0.1, blZ, dark);      // ② 刀牌吊在招牌外沿
+    plate(blX, cy - 0.1, blZ, 0.34, 1.36, glowB, tX, tZ, 0.06);
+    const len = Math.min(b.w * 0.45, 3.4), rcx = dx + fx * 1.05, rcz = dz + fz * 1.05;
+    mm(fx ? 0.1 : len * 0.86, 0.34, fx ? len * 0.86 : 0.1, rcx, b.h + 0.17, rcz, dark);   // ③ 屋顶灯牌:底座 + 箱体 + 两面字
+    mm(fx ? 0.16 : len, 1.0, fx ? len : 0.16, rcx, b.h + 0.84, rcz, dark);
+    plate(rcx, b.h + 0.84, rcz, len, 1.0, glowT, tX, tZ, 0.1);
+    const ring = new THREE.Mesh(unitPlane, new THREE.MeshBasicMaterial({   // ④ 门口光圈:店色亮环,踩门口才看得见
+      map: canvasTexture(ringCv(), 1, 1, true), color: s.K.glow, transparent: true, opacity: 0.95, toneMapped: false, depthWrite: false,
+    }));
+    ring.rotation.x = -Math.PI / 2; ring.scale.set(3.0, 3.0, 1);
+    ring.position.set(dx + fx * 1.85, 0.06, dz + fz * 1.85);            // 环心落在门口台阶外(和门内 0.02 的地垫不同高,不打架)
+    ring.castShadow = false; ring.receiveShadow = false; mark.add(ring);
+    scene.add(mark);
+    s.mark = mark;
+  }
   s.group = g; s.built = true;
 }
 
@@ -1547,6 +2096,11 @@ function enterShop(s) {
   if (inside || mode !== 'foot') return;
   if (!s.built) buildShop(s);
   s.group.visible = true;
+  // 开灯:灯泡色跟着店种走(面馆暖、诊所惨白…),灯位是建屋时按陈设定的。
+  // 一进店就开、出门就灭,而不是全程亮着 —— 不然门口 3 米内会被屋内漏出的光洗白。
+  shopLightA.color.setHex(s.K.lamp); shopLightB.color.setHex(s.K.lamp);
+  shopLightA.position.set(s.lights[0].x, 2.3, s.lights[0].z); shopLightA.intensity = s.lights[0].i;
+  shopLightB.position.set(s.lights[1].x, 2.3, s.lights[1].z); shopLightB.intensity = s.lights[1].i;
   curShop = s; inside = s;
   solidMark = solids.length;
   for (const sp of s.solidSpecs) solids.push({ x: sp.x, z: sp.z, hw: sp.hw, hd: sp.hd, h: sp.h, interior: true });
@@ -1561,6 +2115,10 @@ function enterShop(s) {
   // 街上人偶和主角车,屋里不该看见"自己"停在门外,出门全部还原。
   camX = px + Math.sin(camYaw) * 5.1; camZ = pz + Math.cos(camYaw) * 5.1;
   camY = Math.min(2.5, s.room.h - 0.6);
+  // 地面也必须灭:550 米的大地平面从原点屋底下穿过去,1 厘米的间隙撑不过远处深度精度,
+  // 屋后半径 8 米外就 z-fight —— 木地板被外面的街面一寸寸顶掉,屋里看着成了无尽大街。
+  // 屋里从头到尾看不见街(黑壳挡着),它根本没有"存在"的必要,灭掉最干净。
+  ground.visible = false;
   for (const m of PED_MESHES) m.visible = false;
   hero.visible = false; blobGroup.visible = false;
 }
@@ -1570,6 +2128,7 @@ function exitShop() {
   solids.length = solidMark;                     // 店内碰撞盒整段摘除(它们在表尾,车/街区的下标不动)
   const s = curShop;
   s.group.visible = false;
+  shopLightA.intensity = 0; shopLightB.intensity = 0;   // 出门灭灯(见 enterShop 注释:别让店门口被屋里漏的光洗白)
   // 出门落点必须换算成世界坐标:屋里的 px/pz 是"以原点屋子为中心"的局部系,一出门它就是全城坐标。
   // 门前 1.6 米这个落脚点,生成时已按 1.4 米 / 0.5 身宽验过干净(比门口还外挪 0.2,稳)。
   px = s.dx + s.face.nx * 1.6; pz = s.dz + s.face.nz * 1.6;
@@ -1579,6 +2138,7 @@ function exitShop() {
   // 街上相机本来就压在屋顶之上,高度不用另算;机位落在人背后的街面延长线上。
   camX = px - s.face.nx * 18.7; camZ = pz - s.face.nz * 18.7; camY = 24.4;
   inside = null; curShop = null;
+  ground.visible = true;                           // 地面还回去(见 enterShop:屋里灭它是为躲 z-fight)
   for (const m of PED_MESHES) m.visible = true;
   hero.visible = heroWasVisible;
   blobGroup.visible = true;                      // 步行分支只挪斑不显斑,这里必须还给 true,出店人就永久没影了
@@ -1752,11 +2312,30 @@ function updateCamera(dt, tx, tz, thead, speed) {
     const dist = 5.0 + (userZoom - 1) * 1.6;
     const horiz = dist * Math.cos(rad), high = dist * Math.sin(rad);
     const lag = 1 - Math.exp(-9 * dt);
-    camX += (tx - Math.sin(camYaw) * horiz - camX) * lag;
-    camZ += (tz - Math.cos(camYaw) * horiz - camZ) * lag;
     camY += (Math.min(inside.room.h - 0.55, 1.05 + high) - camY) * lag;
+    // 期望机位先夹进墙,再沿"人→相机"这根杆子往里收:相机也穿模(用户点名) ——
+    // 5 米吊杆怼进柜台/货架/冷柜时,从外向内退到第一个空位为止。只收杆不挪人,
+    // 于是"背对货架倒退"看到镜头滑进柜台、画面变近 —— GTA 同款让位,比黑屏/穿模都体面。
+    // 比相机下半截(camY-0.3)还矮的家具不挡镜头:相机 2.2 米高时越过 1.9 米冰柜是合法构图。
+    let gx = tx - Math.sin(camYaw) * horiz, gz = tz - Math.cos(camYaw) * horiz;
     const mx = inside.room.w / 2 - 0.6, mz = inside.room.d / 2 - 0.6;   // 夹在墙内 0.6 米
-    camX = clamp(camX, -mx, mx); camZ = clamp(camZ, -mz, mz);
+    gx = clamp(gx, -mx, mx); gz = clamp(gz, -mz, mz);
+    const blocked = (bx2, bz2) => {
+      for (const q of solids) {
+        if (!q.interior || q.h <= camY - 0.3) continue;                 // 只有店内盒参与;矮柜从相机头顶过去不算穿
+        const nx = Math.max(q.x - q.hw - 0.12, Math.min(bx2, q.x + q.hw + 0.12));
+        const nz = Math.max(q.z - q.hd - 0.12, Math.min(bz2, q.z + q.hd + 0.12));
+        if ((bx2 - nx) * (bx2 - nx) + (bz2 - nz) * (bz2 - nz) < 0.01) return true;
+      }
+      return false;
+    };
+    if (blocked(gx, gz)) {
+      for (let t = 0.9; t >= 0; t -= 0.15) {
+        const tx2 = tx + (gx - tx) * t, tz2 = tz + (gz - tz) * t;
+        if (!blocked(tx2, tz2)) { gx = tx2; gz = tz2; break; }
+      }
+    }
+    camX += (gx - camX) * lag; camZ += (gz - camZ) * lag;
     camera.position.set(camX, camY, camZ);
     camera.lookAt(tx + Math.sin(camYaw) * 1.6, 1.0, tz + Math.cos(camYaw) * 1.6);
     return;
@@ -1988,6 +2567,38 @@ function resolveCar(r) {
 // ══ 调试快照:harness 直接读游戏真实状态 ══
 window.__gta = {
   seed: SEED.toString(36),               // 本次城市种子:红了拿它拼进 ?seed= 重放同一座城
+  get rafTicks() { return frameCount; },   // rAF 循环计数:探针隔秒读两次一减就知道画面还在不在动
+  turn(rad) { userYaw = rad; },            // 机位偏航:截图找角度用(相机阻尼自己追过去,和拖动一个效果)
+  get vis() {                              // 画面开关全景:排"明明进店了画面却是大街"这类账用
+    const g = inside ? inside.group : null;
+    return { in: inside ? inside.K.name : null, mode, ground: ground.visible,
+      group: g ? g.visible : null, groupKids: g ? g.children.length : 0, hero: hero ? hero.visible : 'null',
+      camY: +camY.toFixed(2), t: +tNow.toFixed(1), raf: frameCount };
+  },
+  snap(sc = 0.5) {
+    // 绕过浏览器合成层直接读 GL 像素:无头截图会停在旧合成帧,这条路截到的才是着色器此刻的真画面。
+    // 渲到一块离屏缓冲再回读,不碰屏幕那张 canvas;返回 PNG 的 dataURL。
+    const w = Math.floor(innerWidth * sc), h = Math.floor(innerHeight * sc);
+    const rt = new THREE.WebGLRenderTarget(w, h);
+    renderer.setRenderTarget(rt); renderer.render(scene, camera);
+    const buf = new Uint8Array(w * h * 4); renderer.readRenderTargetPixels(rt, 0, 0, w, h, buf);
+    renderer.setRenderTarget(null); rt.dispose();
+    const cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+    const img = cv.getContext('2d').createImageData(w, h);
+    for (let y = 0; y < h; y++) {                                  // GL 从下往上,画布从上往下:逐行倒置
+      const src = (h - 1 - y) * w * 4, dst = y * w * 4;
+      for (let x = 0; x < w * 4; x++) img.data[dst + x] = buf[src + x];
+    }
+    cv.getContext('2d').putImageData(img, 0, 0);
+    return cv.toDataURL('image/png');
+  },
+  rayAt(nx = 0, ny = 0) {                   // 朝屏幕这点(归一化 -1..1)射一根:前 3 个真被看见的面。排"镜头里到底是屋里还是大街"的账用。
+    const rc = new THREE.Raycaster();
+    rc.setFromCamera({ x: nx, y: ny }, camera);
+    return rc.intersectObjects(scene.children, true)
+      .filter((h) => { for (let q = h.object; q; q = q.parent) if (!q.visible) return false; return true; })
+      .slice(0, 3).map((h) => ({ d: +h.distance.toFixed(1), c: h.object.material && h.object.material.color ? '#' + h.object.material.color.getHexString() : '?', at: [+h.point.x.toFixed(1), +h.point.y.toFixed(1), +h.point.z.toFixed(1)] }));
+  },
   get jumpH() { return +py.toFixed(2); },   // 离地高度(米),步行跳才有值
   footAt(x, z) { px = x; pz = z; py = 0; vy = 0; grounded = true; },   // 步行瞬移(harness 专用):不上下车,竖直态复位站稳。在店里时坐标是屋内局部系
   get inShop() { return inside ? inside.K.name : null; },
@@ -1995,6 +2606,29 @@ window.__gta = {
   get shopDoors() { return shops.map((s) => ({ name: s.K.name, x: +s.dx.toFixed(1), z: +s.dz.toFixed(1), nx: s.face.nx, nz: s.face.nz })); },
   get shopNear() { if (inside) return 'in'; const s2 = nearShop(); return s2 ? s2.K.name : null; },   // 门口 2.8 米内报店名,否则 null
   get camEye() { return { x: +camX.toFixed(2), y: +camY.toFixed(2), z: +camZ.toFixed(2) }; },          // 相机真实位置(店内机位是否钻墙用)
+  get shopDecor() {                                     // 屋里陈设盘点:贴图网格数 + 点亮灯盏数(精致化断言用)
+    if (!inside) return { tex: 0, lights: 0 };
+    let tex = 0;
+    inside.group.traverse((o) => { if (o.isMesh && o.material.map) tex++; });
+    // 灯泡是两只全程挂在场景里的共享灯(见文件头部注释),不在屋子 group 里 —— 数的是"此刻亮没亮"
+    return { tex, lights: shopLightA.intensity > 0 && shopLightB.intensity > 0 ? 2 : 0 };
+  },
+  get shopMark() {                                      // 街上标志盘点:五家店各自的招牌组(预生成后 n 应恒 ≥10)
+    return shops.map((s2) => ({ name: s2.K.name, n: s2.mark ? s2.mark.children.length : 0 }));
+  },
+  get shopLight() { return Math.round(shopLightA.intensity + shopLightB.intensity); },   // 两灯总强度:出门必须归零,不然门口被屋里洗亮
+  get shopProps() { return inside ? solids.filter((q) => q.interior).length : 0; },   // 店内碰撞盒数(墙 + 家具,推人挡相机全靠它)
+  get shopCamBlock() {                                  // 相机此刻怼在几个店内盒里(穿模断言;出门恒 0)
+    if (!inside) return 0;
+    let n = 0;
+    for (const q of solids) {
+      if (!q.interior || q.h <= camY - 0.3) continue;
+      const nx = Math.max(q.x - q.hw - 0.12, Math.min(camX, q.x + q.hw + 0.12));
+      const nz = Math.max(q.z - q.hd - 0.12, Math.min(camZ, q.z + q.hd + 0.12));
+      if ((camX - nx) * (camX - nx) + (camZ - nz) * (camZ - nz) < 0.01) n++;
+    }
+    return n;
+  },
   enterShop() { if (!inside && mode === 'foot') { const s2 = nearShop(); if (s2) enterShop(s2); } return inside ? inside.K.name : null; },
   exitShop,                                            // 出门走的是和按 E 同一条路径,测的就是玩家路径本身
   get bldMatCount() { return bldMats.length; },   // 墙面贴图类数(5 = 普通 4 类 + 高楼 1 类)

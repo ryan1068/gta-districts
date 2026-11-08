@@ -57,6 +57,9 @@ const room = await page.evaluate(() => window.__gta.shopRoom);
 check('③b 按 E 进屋:inShop=店名、人在屋框内、碰撞盒变多',
   s3.inShop === d0.name && Math.abs(s3.x) < room.w / 2 && Math.abs(s3.z) < room.d / 2 && s3.solidCount > solidBefore,
   `inShop=${s3.inShop} 人=(${s3.x},${s3.z}) 屋=${room.w}×${room.d} 障碍 ${solidBefore}→${s3.solidCount}`);
+check('③c 屋里够精致:陈设有贴图、双灯点亮、家具碰撞盒补齐',
+  s3.shopDecor.tex >= 6 && s3.shopLight >= 6 && s3.shopProps >= 10,
+  `贴图网格=${s3.shopDecor.tex} 灯总强度=${s3.shopLight} 店内盒=${s3.shopProps}`);
 
 // ④ 四面走到极限都穿不出屋(每个方向按住 3 仿真秒,贴墙为止)
 let maxIn = { x: 0, z: 0 }, escaped = null;
@@ -79,10 +82,11 @@ check('④ 四面都穿不出屋(w/s/a/d 各顶 3.2 仿真秒)', !escaped,
 // ⑤ 店内相机:贴着最远角也不钻到墙外/顶穿棚顶
 await page.evaluate(([x, z]) => window.__gta.footAt(x, z), [room.w / 2 - 1.2, room.d / 2 - 1.2]);
 await sleep(S(2500));   // 等相机阻尼把机位推到位(lag≈6/s,2.5 仿真秒足够贴边界)
-const cam = await page.evaluate(() => window.__gta.camEye);
+const cam = await page.evaluate(() => ({ ...window.__gta.camEye, block: window.__gta.shopCamBlock }));
 check('⑤ 店内相机夹在墙内不穿棚',
   Math.abs(cam.x) < room.w / 2 + 0.4 && Math.abs(cam.z) < room.d / 2 + 0.4 && cam.y > 0.5 && cam.y < room.h - 0.4,
   `cam=(${cam.x},${cam.y},${cam.z}) 屋=${room.w}×${room.d}×${room.h}`);
+check('⑤b 贴角机位不怼家具:让位后挡盒数 0', cam.block === 0, `怼进 ${cam.block} 个盒`);
 
 // ⑥ 再按 E 出门:碰撞盒清零,人回到门前世界坐标(店里 px/pz 是局部系,出门必须换算回全城坐标)
 await page.keyboard.press('e');   // 人在屋里任意角落按 E 都行,落点由店门定,不靠"刚才站在哪"
@@ -92,6 +96,9 @@ const distDoor = Math.hypot(s6.x - d0.x, s6.z - d0.z);
 check('⑥ 按 E 出门:inShop=null、站回门前、碰撞盒整段摘掉',
   s6.inShop === null && distDoor < 4 && s6.solidCount === solidBefore,
   `inShop=${s6.inShop} 离门 ${distDoor.toFixed(1)} 米 障碍 ${s6.solidCount}(进店前 ${solidBefore})`);
+check('⑥b 出门屋里清零:灯归零、陈设贴图归零、相机让位归零',
+  s6.shopLight === 0 && s6.shopDecor.tex === 0 && s6.shopProps === 0 && s6.shopCamBlock === 0,
+  `灯=${s6.shopLight} 贴图=${s6.shopDecor.tex} 店内盒=${s6.shopProps} 怼盒=${s6.shopCamBlock}`);
 await page.screenshot({ path: import.meta.dirname + '/../shots/shop-exit.png' });
 
 // ⑦ 屋里能跳、不穿天花板:重新进店,Space 一下,峰值 0.5~1.8 且落回
@@ -114,6 +121,12 @@ await page.screenshot({ path: import.meta.dirname + '/../shots/shop-inside.png' 
 await page.keyboard.press('e');   // 收尾:出门,别把 harness 留在一屋子家具中间
 
 check('⑧ 全程无 JS 报错', errs.length === 0, errs.slice(0, 2).join(' | '));
+
+// ⑨ 街上标志名:招牌组是预生成(+加载后 5 秒)一次性给五家都建好的,进没进过店都该挂在街上。
+// 少了 = 预生成没开/被谁摘了 —— 玩家"很难找"就是这么来的。此刻早已过 5 秒线,五家都必须齐。
+const m9 = await page.evaluate(() => window.__gta.shopMark);
+check('⑨ 五家店街上招牌齐全(每家 ≥10 格:大招牌/刀牌/屋顶灯箱/地面光圈)',
+  m9.length === 5 && m9.every((m) => m.n >= 10), m9.map((m) => `${m.name}:${m.n}`).join(' '));
 console.log(failed ? `${failed} 项未通过` : '全部通过');
 await browser.close();
 process.exit(failed ? 1 : 0);
