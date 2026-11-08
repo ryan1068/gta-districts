@@ -647,7 +647,7 @@ function mkCar(x, z, ry, t) {
 // ══ 车流:自己会开的车 ══
 // 靠右行驶:车道中心在道路中心线 ±2.6,正好避开 4.2 以外的路肩停车带。
 // 每辆车只记「在哪条路、朝哪个方向、下一个路口怎么走」,不需要寻路表。
-const TRAFFIC = 22, LANE = 2.6;
+const TRAFFIC = 30, LANE = 2.6;                   // 用户:路上的车再多点动起来(7×7 城 22 辆太稀)
 let TRACE_I = -1;
 const TRACE_LOG = [];
 function traceCar(c) {                       // 逐帧记录一辆车,别的车不付代价
@@ -1862,7 +1862,9 @@ function buildShop(s) {
   // 外黑壳:BackSide 的"里衬"盒 —— 店里看到的永远只有屋里:楼/树/人/车/地面全被这圈
   // 比屋子大 6 米的不透光盒子挡在墙外(店里只有一间房亮着这件事靠它兜底,不靠运气)。
   const shell = new THREE.Mesh(unitBox, new THREE.MeshBasicMaterial({ color: 0x12141a, side: THREE.BackSide }));
-  shell.position.set(0, 3, 0); shell.scale.set(w + 2 * th + 6, 9.4, d + 2 * th + 6); g.add(shell);
+  // 9.4 米高曾经漏天:墙只有 3.1 米,视线掠墙顶飞向远处,会从壳顶(7.7)上方钻出去看见真空
+  // (snap 实拍实测屋梁上一条蓝天)。壳顶抬到 12 米、底沉到 -4 米,任何机位仰角都被兜住。
+  shell.position.set(0, 4, 0); shell.scale.set(w + 2 * th + 6, 16, d + 2 * th + 6); g.add(shell);
   // 门那一面:里侧发光门板(出门就靠它指路)+ 两扇亮窗给屋里"借"点街光 + 门前地垫
   const fx = s.face.nx, fz = s.face.nz;
   const lx = fx ? fx * (w / 2 - 0.04) : s.t, lz = fx ? s.t : fz * (d / 2 - 0.04);
@@ -2079,7 +2081,9 @@ function buildShop(s) {
     const len = Math.min(b.w * 0.45, 3.4), rcx = dx + fx * 1.05, rcz = dz + fz * 1.05;
     mm(fx ? 0.1 : len * 0.86, 0.34, fx ? len * 0.86 : 0.1, rcx, b.h + 0.17, rcz, dark);   // ③ 屋顶灯牌:底座 + 箱体 + 两面字
     mm(fx ? 0.16 : len, 1.0, fx ? len : 0.16, rcx, b.h + 0.84, rcz, dark);
-    plate(rcx, b.h + 0.84, rcz, len, 1.0, glowT, tX, tZ, 0.1);
+    // 字要贴在大面上:箱体长轴沿墙面(t),大面法线是 ±正面 —— 曾用 tX,tZ,字贴到了
+    // 0.16 米厚的窄端面上,沿街看见的是一整块黑裸板(用户:"房顶的牌子中间有一条黑的")。
+    plate(rcx, b.h + 0.84, rcz, len, 1.0, glowT, fx, fz, 0.1);
     const ring = new THREE.Mesh(unitPlane, new THREE.MeshBasicMaterial({   // ④ 门口光圈:店色亮环,踩门口才看得见
       map: canvasTexture(ringCv(), 1, 1, true), color: s.K.glow, transparent: true, opacity: 0.95, toneMapped: false, depthWrite: false,
     }));
@@ -2090,6 +2094,11 @@ function buildShop(s) {
     s.mark = mark;
   }
   s.group = g; s.built = true;
+  // 命根子:屋组必须挂进场景 —— 曾经只 s.group=g 没 scene.add(g),全屋 45 件陈设成了
+  // 无父悬空组:不渲染、射线也打不到,进店看见的其实是世界原点那块路口的街面(用户实测
+  // "进店还是大街")。逻辑断言(碰撞盒/四向穿墙/相机夹壁)全在 solids 层面,瞎得没脾气,
+  // 只有肉眼/GL 回读能逮 —— 教训记进 README 验证节的"截图只信 snap()"。
+  scene.add(g);
 }
 
 function enterShop(s) {
@@ -2578,7 +2587,10 @@ window.__gta = {
   snap(sc = 0.5) {
     // 绕过浏览器合成层直接读 GL 像素:无头截图会停在旧合成帧,这条路截到的才是着色器此刻的真画面。
     // 渲到一块离屏缓冲再回读,不碰屏幕那张 canvas;返回 PNG 的 dataURL。
-    const w = Math.floor(innerWidth * sc), h = Math.floor(innerHeight * sc);
+    // 尺寸跟 canvas 属性像素走(不是 innerWidth/innerHeight):HUD 在布局里吃掉约 32 垂直像素,
+    // canvas 真身比窗口矮一截,用窗口尺寸算 rt 会把顶上一截渲不到 —— 实拍里表现为屋梁上一条"蓝天",
+    // 差之 4% 行,骗过射线(射线对的是 camera,不是 rt)。
+    const c2 = renderer.domElement, w = Math.floor(c2.width * sc), h = Math.floor(c2.height * sc);
     const rt = new THREE.WebGLRenderTarget(w, h);
     renderer.setRenderTarget(rt); renderer.render(scene, camera);
     const buf = new Uint8Array(w * h * 4); renderer.readRenderTargetPixels(rt, 0, 0, w, h, buf);

@@ -108,8 +108,22 @@ const d = await g();
 check('刹停后可以倒车', d.forward < -1, `倒车速度 ${d.forward}`);
 
 // ── 转向符号:朝屏幕左偏(这个世界里 heading 增大 = 屏幕左)──
-await page.keyboard.press('r');
-await sleep(300);
+// 流车提到 30 辆后,"回到路口立刻起步"的摆位常常正前顶着一辆停泊/切入的流车,
+// 1.4 秒转向全程被夹速(z6l5p0 复现:里程仅 +2.2、净位移 0.0 = 原地顶着车蹭)。
+// 和倒车那步筛"后方走廊"同一套路:摆到前方 14 米无实体、16 米点周围 7 米内没流车才开测,
+// 只筛环境运气,判据(里程 >5)一字不改。
+let tnFront = false;
+const tnT0 = Date.now();
+while (!tnFront && Date.now() - tnT0 < S(15000)) {
+  tnFront = await page.evaluate(() => {
+    const G = window.__gta;
+    G.spawnAt(30, 30, Math.random() < 0.5 ? 0 : Math.PI / 2);       // 路口的两个车道方向轮着试
+    const ry = G.heading, fx = Math.sin(ry), fz = Math.cos(ry);
+    for (let s = 4; s <= 14; s += 2) if (G.probeSolid(G.x + fx * s, G.z + fz * s)) return false;
+    return !G.cars.some((c) => Math.hypot(c.x - (G.x + fx * 16), c.z - (G.z + fz * 16)) < 7);
+  });
+  if (!tnFront) await sleep(S(1300));
+}
 await hold(['ArrowUp'], 1200);
 const t0 = await g();
 await hold(['ArrowUp', 'ArrowLeft'], 1400);
@@ -217,7 +231,7 @@ check('自己坐着时车顶标记隐藏', inCar.blip === null, JSON.stringify(i
 // 泊位稀疏化(用户说"路边停的车太多了",190 → 实测 28~62)后,总数从 ~190 跌到 50~85,
 // 老的 >80 阈值是满街停车场时代的产物。改数"路边停着能抢的":25 = 实测最低 28 再低一档。
 const parkedAvail = await page.evaluate(() => window.__gta.cars.filter((c) => !c.traffic && !c.blanked).length);
-check('街上有得是车可抢', parkedAvail >= 25, `路边停着 ${parkedAvail} 辆(22 辆流车不在此列)`);
+check('街上有得是车可抢', parkedAvail >= 25, `路边停着 ${parkedAvail} 辆(路上流车不在此列)`);
 
 await page.keyboard.press('f');                       // 下车
 await sleep(S(300));
@@ -426,8 +440,16 @@ if (Y) {
     };
     step();
   }, tgt2);
+  // 撞击窗改"盯着直到撞上才松油门"(最多 9 仿真秒):30 辆流车的长直道上目标多半巡航不
+  // 让路(u8alm2/z6l5p0 两红同因:3 秒固定窗里我刚提速,目标已跑出一百多米,minD=99=全程
+  // 没近过身)。旧窗是 22 辆时代"目标常刹停让路"的节奏留下的,判据(+hits)一字不动。
   await page.keyboard.down('ArrowUp');
-  await sleep(S(3000));
+  const ramPollT0 = Date.now();
+  while (Date.now() - ramPollT0 < S(9000)) {
+    await sleep(S(400));
+    const ramSoFar = await page.evaluate(() => (window.__ram ? window.__gta.hits - window.__ram.h0 : 0));
+    if (ramSoFar > 0) break;                                    // 撞上了,立刻收油门(别追尾连锁)
+  }
   await page.keyboard.up('ArrowUp');
   a = await page.evaluate((o) => {                              // 别写成 const a:会遮蔽外层的 let a,循环外全读空值
     const G = window.__gta, c = G.carState(o.i);
@@ -775,6 +797,15 @@ await page.screenshot({ path: import.meta.dirname + '/shots/w1-peds.png' });
   const gCam = await g();
   check('屋中心机位不怼家具:相机沿人-机位连线让位后 0 盒挡', gCam.shopCamBlock === 0,
     `怼进 ${gCam.shopCamBlock} 个盒 机位=(${gCam.camEye.x},${gCam.camEye.y},${gCam.camEye.z})`);
+  // 屋组必须真挂在场景里(snap 实拍逮过的"悬空组"惨案:45 件陈设不渲染,进店看见原点大街,
+  // 而碰撞/相机断言全绿)。射线是唯一能看见这件事的断言:四向首击都得落在 21 米内的屋皮上。
+  const raysIn = await page.evaluate(() => [[0, 0], [-0.5, 0], [0.5, 0], [0, 0.9]].map(([a, b]) => {
+    const h = window.__gta.rayAt(a, b);
+    return h.length ? h[0].d : -1;
+  }));
+  check('屋组挂进了场景:店内四向射线全打到 ≤21 米屋皮、中心向 ≤12.5 米',
+    raysIn.every((d) => d > 0 && d < 21) && raysIn[0] < 12.5,
+    `首击=[${raysIn.map((d) => (d < 0 ? '空' : d.toFixed(1))).join(', ')}]`);
   await page.keyboard.press('e');   // 出门
   await sleep(S(500));
   const gOut = await g();

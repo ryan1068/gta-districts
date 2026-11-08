@@ -87,6 +87,16 @@ check('⑤ 店内相机夹在墙内不穿棚',
   Math.abs(cam.x) < room.w / 2 + 0.4 && Math.abs(cam.z) < room.d / 2 + 0.4 && cam.y > 0.5 && cam.y < room.h - 0.4,
   `cam=(${cam.x},${cam.y},${cam.z}) 屋=${room.w}×${room.d}×${room.h}`);
 check('⑤b 贴角机位不怼家具:让位后挡盒数 0', cam.block === 0, `怼进 ${cam.block} 个盒`);
+// ⑤c 屋组真挂进了场景(snap 实拍发现的"悬空组"惨案防回归):四个方向射线必须都打到 21 米内的
+// 屋皮/陈设(壳内最大几何距离也就壳对角),中心方向必须 ≤12.5 米(后墙内皮 9.2 + 余量)。
+// 悬空组时代碰撞/相机断言全绿而画面是大街 —— 这套件里只有射线看得见真相。
+const raysIn = await page.evaluate(() => [[0, 0], [-0.5, 0], [0.5, 0], [0, 0.9]].map(([a, b]) => {
+  const h = window.__gta.rayAt(a, b);
+  return h.length ? h[0].d : -1;
+}));
+check('⑤c 屋组在场景里:四向射线全打到 ≤21 米的屋里皮(悬空组=打空或打几百米外街皮)',
+  raysIn.every((d) => d > 0 && d < 21) && raysIn[0] < 12.5,
+  `四向首击距离=[${raysIn.map((d) => (d < 0 ? '空' : d.toFixed(1))).join(', ')}](序:中心/左/右/上)`);
 
 // ⑥ 再按 E 出门:碰撞盒清零,人回到门前世界坐标(店里 px/pz 是局部系,出门必须换算回全城坐标)
 await page.keyboard.press('e');   // 人在屋里任意角落按 E 都行,落点由店门定,不靠"刚才站在哪"
