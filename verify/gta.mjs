@@ -828,6 +828,115 @@ await sleep(700);
 await page.screenshot({ path: import.meta.dirname + '/shots/g7-man-closeup.png' });
 await page.evaluate(() => { window.__gta.fov = 56; });
 
+// ── 警察/通缉(用户四选:3 星档 / 清星回路口 / 顶撞+围捕不开枪 / 0 星常驻 2 辆巡逻可抢)──
+// 先清掉前半段碾人/抡拳/顶车攒的热度,城回到 0 星口径点名。setHeat 第二参是"清静保护秒数":
+// 像刚当街犯完事,8 仿真秒内不消热 —— 不带保护追捕车还没从 ≥60 米合拢星就灭光(看门狗实拍)。
+await page.evaluate(() => window.__gta.setHeat(0));
+{
+  let roll = null;
+  const t0 = Date.now();
+  while (Date.now() - t0 < S(6000)) {
+    roll = await page.evaluate(() => {
+      const cs = window.__gta.cops;
+      return { stars: window.__gta.stars, n: cs.length,
+        pat: cs.filter((c) => c.police === 'patrol' && !c.blanked).length,
+        pool: cs.filter((c) => c.police === 'pool' && c.blanked).length };
+    });
+    if (roll.stars === 0 && roll.pat === 2 && roll.pool === 4) break;
+    await sleep(S(600));
+  }
+  check('警车 6 辆点名:2 辆巡逻上街、4 辆停编藏形、0 星星灭干净',
+    roll.n === 6 && roll.pat === 2 && roll.pool === 4 && roll.stars === 0,
+    `点名=${roll.n} 巡逻=${roll.pat} 停编=${roll.pool} 星=${roll.stars}`);
+}
+const typesP = await page.evaluate(() => Object.keys(window.__gta.carTypes));
+check('民用车型盘点不掺警色(警色归通缉系统自己点名)', !typesP.includes('警车'), typesP.join('/'));
+{
+  let pm = 0;
+  const t0 = Date.now();
+  while (Date.now() - t0 < S(5000) && pm < 1) {
+    await sleep(S(800));
+    pm = await page.evaluate(() => window.__gta.cops.filter((c) => c.police === 'patrol' && !c.blanked && c.spd > 1).length);
+  }
+  check('0 星巡逻车活着在巡航(≥1 辆 spd>1)', pm >= 1, `跑着的巡逻车=${pm}`);
+}
+// 3 星光脚站定必捕:4 辆全出动,绕着楼摸进来、4.5 米停编贴脸,围捕表攒满 3 秒收网
+const bustBase = (await g()).busts;
+// BUSTED 横幅按墙钟 ≤1 秒/秒退(慢机器约 2 秒就褪干净):主套件 S(1500) 一抽就是 5 秒开外
+// 墙钟,横幅必然抽没了 —— 页内挂 100ms 墙钟线人,被捕那一拍当场定格快照再交给 node 端验。
+await page.evaluate(() => {
+  const G = window.__gta;
+  window.__bs = { b0: G.busts, snap: null };
+  window.__bs.iv = setInterval(() => {
+    const g2 = window.__gta;
+    if (g2.busts > window.__bs.b0 && !window.__bs.snap) {
+      window.__bs.snap = { stars: g2.stars, heat: g2.heat, mode: g2.mode, x: g2.x, z: g2.z,
+        bustShow: g2.bustShow, busts: g2.busts, heroPos: g2.heroPos };
+      clearInterval(window.__bs.iv);
+    }
+  }, 100);
+});
+await page.evaluate(() => { const G = window.__gta; G.standAt(G.x, G.z); G.setHeat(3.2, 8); });
+let bustQ = null;
+{
+  const t0 = Date.now();
+  while (Date.now() - t0 < S(45000)) {
+    await sleep(S(1500));
+    bustQ = await page.evaluate(() => window.__bs.snap);
+    if (bustQ) break;
+  }
+}
+check('3 星光脚站定 45 仿真秒内必捕(BUSTED)', !!bustQ,
+  bustQ ? `busts ${bustBase} → ${bustQ.busts}` : '45 仿真秒没人收网');
+if (bustQ) {
+  const onGrid = (v) => { const m = (((v + 210) % 60) + 60) % 60; return m < 0.5 || m > 59.5; };
+  check('被捕善后:星清零、塞回车里、落最近路口格点、横幅亮、主角车可见没穿帮',
+    bustQ.stars === 0 && bustQ.heat === 0 && bustQ.mode === 'car' && onGrid(bustQ.x) && onGrid(bustQ.z) &&
+    bustQ.bustShow > 0 && bustQ.heroPos[3] === true,
+    `星=${bustQ.stars} mode=${bustQ.mode} 人=(${bustQ.x},${bustQ.z}) 横幅=${bustQ.bustShow} 车可见=${bustQ.heroPos[3]}`);
+}
+// 小店 = 安全屋:3 星进店 → 追捕归零、星速灭、屋里不设捕、人还在(不带 grace,就是要秒灭)
+await page.evaluate(() => {
+  const G = window.__gta;
+  G.setHeat(3.3);
+  const d = G.shopDoors[0];
+  G.standAt(G.x, G.z);
+  G.footAt(d.x + d.nx * 1.4, d.z + d.nz * 1.4);
+  G.enterShop();
+});
+{
+  const base9 = (await g()).busts;
+  let starsOut = -1, chOut = 9;
+  const t0 = Date.now();
+  while (Date.now() - t0 < S(20000)) {
+    const st = await page.evaluate(() => {
+      const G = window.__gta;
+      return { stars: G.stars, ch: G.copChasers(), busts: G.busts, inShop: G.inShop };
+    });
+    starsOut = st.stars; chOut = st.ch;
+    if (st.stars === 0 && st.ch === 0) break;
+    await sleep(S(1000));
+  }
+  const g9 = await g();
+  check('安全屋:3 星进店星灭到 0、追捕全退巡航、屋里不设捕、人还在店里',
+    starsOut === 0 && chOut === 0 && g9.busts === base9 && !!g9.inShop,
+    `星末=${starsOut} 追捕末=${chOut} busts=${g9.busts}(基准${base9}) inShop=${g9.inShop}`);
+  await page.evaluate(() => window.__gta.exitShop());
+}
+// 警车可抢(用户:"常驻可抢"):F 跳上警色车 + 整编 6 辆不破、0 星街面巡回复位
+const jP = await page.evaluate(() => {
+  const G = window.__gta; G.standAt(G.x, G.z);
+  const r = G.jumpToType('警车');
+  return r ? { type: G.carType, driven: G.cops.some((c) => c.driven) } : null;
+});
+check('F 能抢警车:跳上后 carType=警车、点名表标出您在开', !!jP && jP.type === '警车' && jP.driven, JSON.stringify(jP));
+const cP = await page.evaluate(() => {
+  const G = window.__gta;
+  return { n: G.cops.length, pat: G.cops.filter((c) => c.police === 'patrol' && !c.blanked).length };
+});
+check('警车池 6 辆整编不破、0 星街面巡回复位 ≥2(抢走一辆会补编)',
+  cP.n === 6 && cP.pat >= 2, `点名=${cP.n} 巡航=${cP.pat}`);
+
 check('没有 404 / 控制台报错', logs.length === 0, logs.slice(0, 4).join(' | '));
 
 console.log('\n' + (failed ? `${failed} 项未通过` : '全部通过'));

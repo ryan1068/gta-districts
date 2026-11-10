@@ -568,6 +568,9 @@ const TYPES = [
   { key: 'sport',  geo: 'sport',  name: '跑车',   w: 0.12, top: 1.18, acc: 1.3 },
   { key: 'van',    geo: 'van',    name: '货车',   w: 0.14, top: 0.78, acc: 0.7 },
   { key: 'pickup', geo: 'pickup', name: '皮卡',   w: 0.16, top: 0.9,  acc: 0.9 },
+  // 警车 = 轿车壳黑白涂装:w=0 → pickType 永远摇不到(民用车流不会混进警车);
+  // 只由下面"通缉系统"那段手动创建。top 1.12 = 追捕极速 CAR_MAX×1.12≈29 比跑车慢、比轿车快。
+  { key: 'cop',    geo: 'sedan',  name: '警车',   w: 0,    top: 1.12, acc: 1.2, color: 0xe9edf2, cop: true },
 ];
 const TBY = {};
 TYPES.forEach((t) => { TBY[t.key] = t; });
@@ -596,7 +599,7 @@ let active = null, myCar = null;             // 正在开的 / 和你绑定的�
 function mkCar(x, z, ry, t) {
   t = t || pickType();
   const g = GEO[t.geo];
-  const c = { i: cars.length, x, z, ry, t, g: t.geo, slot: 0, sign: -1, blanked: false,
+  const c = { i: cars.length, x, z, ry, t, g: t.geo, slot: 0, sign: -1, police: 'off', blanked: false,
               color: t.color || pick(CARC), top: t.top, acc: t.acc, traffic: false };
   cars.push(c);
   addSolid(x, z, g.W, g.L);   // addSolid 收的是全尺寸(内部除 2):原来这里传了半尺寸,车头顶车头只停到 2.6 米,两车看着叠在一起
@@ -718,7 +721,13 @@ const clampT = (i) => Math.max(TMIN, Math.min(TMAX, i));
 
 function updateTraffic(dt) {
   for (const c of cars) {
+    if (c.police === 'chase' && !c.blanked) {          // 追捕警车自己开(copChase),不玩让路右手法则那套
+      c.lampPol = (c.lampPol || 0) + dt;               // 闪条相位在"这辆车此刻由谁开"的地方推进,writeCar 只管按相位贴(不读时钟,躲加载期 TDZ)
+      copChase(c, dt);
+      continue;
+    }
     if (!c.trafficAI || c.blanked) continue;
+    if (c.t.cop) c.lampPol = (c.lampPol || 0) + dt;    // 巡逻闪条巡航时也闪:走车流 AI 的同一帧顺手推进
     if (c.i === TRACE_I) traceCar(c);
     const g = GEO[c.g], fx = Math.sin(c.ry), fz = Math.cos(c.ry);
     let want = c.cruise, staticBlock = false, row = false, hard = false;   // row=因路权停,hard=跟前车/静止车顶住了
@@ -821,6 +830,202 @@ function updateTraffic(dt) {
 }
 
 spawnTraffic();
+
+// ══ 警车池(用户:"无警察/通缉,这个做一下";四选:3 星档 / 清星+路口复活 / 顶撞+围捕 / 常驻 2 辆可抢)══
+// 6 辆黑白警车(轿车壳 TBY.cop,w=0 所以 pickType 摇不到,民用车流不会混进警色):挂进 cars[]
+// 走同一套物理、同一套碰撞盒、同一套实例化;巡逻态 = 和民用车同款的 trafficAI AI(现有"流车"
+// 断言按民用car 口径数它们,不会误伤 —— 它们本来就守同样规矩),0 星时 F 键还能抢巡逻车开
+// (用户想抢警车就抢)。追捕态切走 trafficAI=false、由 copChase 自己开,民用流车的车道/让行/
+// 追尾断言从此天然看不见它们(全按 trafficAI 过滤)。
+for (const [ai, bi, axis, dir] of [[2, 4, 'x', 1], [4, 2, 'z', -1]]) {
+  // 巡逻 2 辆:照 spawnTraffic 的公式上内圈车流,一横一竖两条街错开
+  const line = camPath(ai), mid = camPath(bi);
+  const x = axis === 'x' ? mid : line - LANE * dir;
+  const z = axis === 'x' ? line + LANE * dir : mid;
+  const c = mkCar(x, z, ryOf(axis, dir), TBY.cop);
+  Object.assign(c, {
+    traffic: true, trafficAI: true, police: 'patrol', spd: rand(8, 11), cruise: rand(8, 11),
+    axis, dir, line, lane: axis === 'x' ? z : x, turn: null, nextCross: nextCrossCoord(dir, mid),
+  });
+}
+for (let n = 0; n < 4; n++) {
+  // 增援 4 辆:内圈四角(±150=camPath(1)/camPath(6))blanked 停编,涨星才调上
+  const c = mkCar(n & 1 ? 150 : -150, n & 2 ? 150 : -150, (n & 1 ? 1 : -1) * Math.PI / 2, TBY.cop);
+  c.police = 'pool'; c.blanked = true;
+}
+
+// ══ 通缉:heat → 星 → 警车调派 → 被捕,全在这段(不开枪、不涉钱,用户拍板)══
+// 热度涨:碾行人(只有你开的车算)+0.55 ≈ 两命换一星;光脚抡拳命中 +0.18;高速软顶民车/流车
+// +0.06/次(蛮干慢涨)。STAR_T 过线 = 1/2/3 星:追捕车数 = 星+1、封顶 4(巡逻那 2 辆就近就地
+// 转追捕,缺口从离你 ≥60 米的远处路口调增援,绝不当脸刷)。消热要"清静"8 仿真秒起步:被追
+// 14 米内 0.06/s、55 米内 0.10/s、看得见摸不着 0.14/s、没人看见你 0.35/s、躲小店(安全屋)0.8/s。
+// 被捕:徒步被追捕车贴到 5.5 米内累计 3 秒(两辆以上围住 2.4 倍速);开车被贴车身(7 米内且
+// 对方还在动)且自己轰不起(<3.5m/s)累计 4 秒。BUSTED = 横幅 2.2 秒 + 星清零 + 人车拎回最近
+// 路口(R 键同一条路)。屋里不设捕:进店就是安全屋,追捕车退回巡航,星灭得最快。
+let heat = 0, stars = 0, lastCrime = -99, busts = 0, bustT = 0, bustShowT = 0, copTick = 0;
+let hitSoft = 0;                                       // 上一帧"软顶(会让路的车)"最大法向速度,供"顶民车长热"用
+const STAR_T = [1, 2.1, 3.2];                          // 3 星档:heat 过 1/2.1/3.2 吃 1/2/3 星
+const copPool = cars.filter((c) => c.t.cop);           // 固定 6 辆池,加载建齐,永不增删(实例容量也因此不用扩)
+const addHeat = (v) => { heat = Math.min(4.5, heat + v); lastCrime = tNow; };   // tNow 声明在后、只在帧内被调
+const heroPos2 = () => [mode === 'car' ? hx : px, mode === 'car' ? hz : pz];
+function copSeenDist() {                               // 最近追捕警车的距离:衰减率按它定;1e9=街上没追捕车
+  const [ax, az] = heroPos2();
+  let d = 1e9;
+  for (const q of copPool) {
+    if (q.police !== 'chase' || q.blanked) continue;
+    d = Math.min(d, Math.hypot(q.x - ax, q.z - az));
+  }
+  return d;
+}
+function copSpawnPoint() {
+  // 调增援点:离你 ≥60 米的内圈路口(绝不当脸刷),且附近 9 米内没活车停着(别落车顶到谁)
+  const [ax, az] = heroPos2();
+  const cand = [];
+  for (let i = 1; i <= GRID - 1; i++) for (let j = 1; j <= GRID - 1; j++) {
+    const x = camPath(i), z = camPath(j);
+    if (Math.hypot(x - ax, z - az) < 60) continue;
+    if (cars.some((q) => !q.blanked && q !== active && Math.hypot(q.x - x, q.z - z) < 9)) continue;
+    cand.push([x, z]);
+  }
+  if (!cand.length) return [camPath(1), camPath(1)];   // 理论极端(全城路口被车占满):退到角上,让碰撞顶开
+  return cand[(rng() * cand.length) | 0];
+}
+function copChase(c, dt) {
+  // 追捕 = 盯前导点(你 0.8 秒后会在的位置)。纯追踪一头拱进楼里是实拍出来的教训(2026-11-10
+  // 遥测钉死):抄近横穿街区 → 中心落进楼盒被 pushOut 每帧顶 1 米(旧版还只认 +z 方向),车头
+  // 照拧人照飞,对角线歪着越开越偏,贴不到人还甩到城边瞬移。所以:正前 10 米或车身自身撞了
+  // 实体,就转 8 向射线挑"最顺路又通"的方向绕着楼走;射线全堵死(真被楼围了)倒着找口。
+  // 穿公园/停车场抄近道仍然合法(那些地方没盒)。极速按星涨留活路:1★15/2★17/3★19,民用 26。
+  const g = GEO[c.g];
+  const [ax, az] = heroPos2();
+  const pvx = mode === 'car' ? vx : 0, pvz = mode === 'car' ? vz : 0;
+  const atGoal = Math.atan2(ax - c.x, az - c.z);                 // 直指目标(lead 只在下面限速用,方向自己会追)
+  const dNow = Math.hypot(ax - c.x, az - c.z);
+  const top = 13 + stars * 2;
+  // 贴脸停编(看门狗二修/三修,2026-11-10):全速穿身而过、提前躺平都贴不稳 —— 实测贴距 0.5 米
+  // 时车在 5.5 米带里跳进跳出,围捕表峰值只攒到 1.38(要 3);另一版 8 米就归零,滑行停在 7.5 米
+  // (带外)车速 0.5 干耗到星灭。围捕的语义是"开到你身边按住":徒步 4.5 米停进 5.5 围捕带、开车
+  // 6 米停进 7 米别停带(它没有碰撞,不收油门会直接埋进你车再开出来);归零只在到位那一刻,
+  // 路上按 2 米/秒线性收口,一定把最后几米拱完。你走了它重新油门跟上去(离得远不收速)。
+  const parkAt = mode === 'foot' ? 4.5 : 6;
+  const ease = Math.min(top, Math.max(0, (dNow - parkAt) * 2));
+  // 围捕段(parkAt+4 米内)认定人:贴脸时正前/射线探到的多半是人"身后"的楼,拿它绕路会变成
+  // 沿着街蹭着就是不进来;蠕行蹭角靠 pushOut 就能扶正,不值得绕。
+  const close = dNow < parkAt + 4;
+  // 探测一律探到"人前"为止(四修,2026-11-10):10 米硬探/18 米射线会把人身后的墙当拦路石,
+  // 实测 9~15 米带上误判 blocked → 转射线沿着街开走(12→24 米),回头再进带来再走,永远骑游。
+  const wlen = Math.min(10, Math.max(2, dNow - 1.5));            // 正前探:到人已够,人后面的墙不算墙
+  const rlen = Math.min(18, Math.max(5, dNow));                  // 射线同规矩:够验到人身前就行
+  const fx0 = Math.sin(c.ry), fz0 = Math.cos(c.ry);
+  const blocked = !close && probeSolid(c.x + fx0 * wlen, c.z + fz0 * wlen, 1.5, c.solid, false);   // 正前(人前)顶楼
+  const stuck = !close && probeSolid(c.x, c.z, 1.2, c.solid, false);                              // 车身已在楼/树盒里
+  if (blocked || stuck) {
+    let best = null, bs = -2;
+    for (let k = 0; k < 8; k++) {                                // 8 向射线:rlen 米通(留 2 米余量)、最顺目标
+      const a = k * Math.PI / 4;
+      if (probeSolid(c.x + Math.sin(a) * rlen, c.z + Math.cos(a) * rlen, 2, c.solid, false)) continue;
+      const s = Math.cos(a - atGoal) + Math.cos(a - c.ry) * 0.3;   // 顺目标为主,顺当前车头 0.3 防抖
+      if (s > bs) { bs = s; best = a; }
+    }
+    const aim = best !== null ? best : atGoal + Math.PI;           // 八面全堵:车尾朝人倒出去找口
+    c.ry += clamp(shortAngle(aim - c.ry), -3.2 * dt, 3.2 * dt);
+  } else {
+    c.ry += clamp(shortAngle(Math.atan2(ax + pvx * 0.8 - c.x, az + pvz * 0.8 - c.z) - c.ry), -2.2 * dt, 2.2 * dt);
+  }
+  const fx = Math.sin(c.ry), fz = Math.cos(c.ry);
+  // 撞楼/堵死时 4.5:蠕动够绕着楼拐,又不至于慢到永远贴不上人(旧 2.5 实测拱不出楼群)。
+  c.want = (blocked || stuck) ? 4.5 : (inside ? 7 : ease);   // 进店(它跟不进):门口蠕行等转回巡航
+  c.spd = Math.max(0, c.spd + clamp(c.want - c.spd, -14 * dt, 10 * dt));
+  c.x += fx * c.spd * dt; c.z += fz * c.spd * dt;
+  const bx = c.x, bz = c.z;
+  const o = pushOutStatic(c.x, c.z, g.W * 0.5);
+  c.x = o.x; c.z = o.z;
+  c.drift = Math.max(c.drift || 0, Math.hypot(c.x - bx, c.z - bz));
+  if (c.x < -HALF || c.x > HALF || c.z < -HALF || c.z > HALF) {
+    const [qx, qz] = copSpawnPoint();                  // 被顶出城边:远处路口归位,不漂移进虚空
+    c.x = qx; c.z = qz; c.spd = 0;
+  }
+  syncSolid(c); writeCar(c);
+}
+function copAssign() {                                 // 每 0.8 仿真秒一轮:转态是"事件",断言好轮询
+  const need = stars > 0 ? Math.min(4, 1 + stars) : 2; // 1★=2辆 2★=3辆 3★=4辆封顶;0 星街面留 2 辆巡逻
+  let ch = 0;
+  for (const c of copPool) if (c.police === 'chase') ch++;
+  for (const c of copPool) {                           // 星降/清空:多余的追捕车就地转回巡航(街面不凭空少车)
+    if (ch <= need || c.police !== 'chase') continue;
+    c.police = 'patrol'; c.trafficAI = true; relane(c); c.cruise = rand(8, 11); ch--;
+  }
+  if (stars > 0) {
+    // 缺口先转"已经在街上"的巡逻车(就近就地,离你最近的那辆先转 —— 设计说的就是这个),
+    // 巡逻车全转完还不够,再从 ≥60 米外路口调停编增援(绝不当脸刷)。
+    while (ch < need) {
+      let pick = null, pd = 1e9;
+      for (const c of copPool) {
+        if (c.police !== 'patrol' || c.blanked || c === active) continue;
+        const d = Math.hypot(c.x - heroPos2()[0], c.z - heroPos2()[1]);
+        if (d < pd) { pd = d; pick = c; }
+      }
+      if (pick) { pick.police = 'chase'; pick.trafficAI = false; pick.lampPol = 1; ch++; continue; }
+      const any = copPool.find((c) => c.police === 'pool');
+      if (!any) break;                                        // 理论没缺口(池里真一辆不剩):下一轮再来
+      const [qx, qz] = copSpawnPoint();
+      any.x = qx; any.z = qz; any.spd = 0; any.police = 'chase'; any.trafficAI = false;
+      any.blanked = false; any.lampPol = 1;
+      syncSolid(any); writeCar(any); ch++;
+    }
+  } else {
+    for (const c of copPool) {                         // 通缉清零:剩下的追捕车转巡航(警察不蒸发)
+      if (c.police === 'chase') { c.police = 'patrol'; c.trafficAI = true; relane(c); c.cruise = rand(8, 11); }
+    }
+    for (const c of copPool) if (c.police === 'patrol') ch++;   // 转完再数一遍
+    for (const c of copPool) {                         // 巡逻车被您抢走了:补一辆停编车归位
+      if (ch >= 2 || c.police !== 'pool') continue;
+      c.police = 'patrol'; c.trafficAI = true; c.blanked = false; relane(c);
+      c.cruise = rand(8, 11); c.spd = rand(5, 9);
+      syncSolid(c); writeCar(c); ch++;
+    }
+  }
+}
+function copArrest() {
+  const [cx0, cz0] = nearestCrossing(hx, hz);
+  heat = 0; stars = 0; bustT = 0; busts++; bustShowT = 2.2;
+  placeAt(cx0, cz0, hh);                               // R 键同一条路:在店里先算出门,再把人车塞上
+}
+function copBusted(dt) {
+  if (inside || bustShowT > 0 || stars === 0) { bustT = Math.max(0, bustT - 2 * dt); return; }   // 屋里不设捕
+  const [ax, az] = heroPos2();
+  const spd = Math.hypot(vx, vz);
+  let near = 0, near2 = 0, box = 0;
+  for (const q of copPool) {
+    if (q.police !== 'chase' || q.blanked) continue;
+    const d = Math.hypot(q.x - ax, q.z - az);
+    if (d < 5.5) near++;
+    if (d < 9) near2++;
+    // 停编围捕后 box 换语义(2026-11-10):不再是"压着油门贴你"(追捕车现在到点停编,spd→0),
+    // 改成"它在你车 7 米内候着、你自己轰不起(<3.5 m/s)"= 别停成了。挣脱窗照旧按回吐算。
+    if (mode === 'car' && d < 7) box++;
+  }
+  if (mode === 'foot') {
+    if (near) bustT += dt * (near2 >= 2 ? 2.4 : 1);
+    else bustT = Math.max(0, bustT - 1.5 * dt);
+    if (bustT >= 3) copArrest();
+  } else {
+    if (box && spd < 3.5) bustT += dt * (box >= 2 ? 1.8 : 1);
+    else bustT = Math.max(0, bustT - 1.8 * dt);
+    if (bustT >= 4) copArrest();
+  }
+}
+function updatePolice(dt) {                            // 每帧:星数、消热、0.8 秒一次调派、被捕判定
+  stars = STAR_T.filter((t) => heat >= t).length;
+  if (tNow - lastCrime > 8) {                          // 8 仿真秒清静才允许开始消(犯完事秒逃不掉)
+    const d = copSeenDist();
+    const rate = inside ? 0.8 : d < 14 ? 0.06 : d < 55 ? 0.1 : d >= 1e9 ? 0.35 : 0.14;
+    heat = Math.max(0, heat - rate * dt);
+  }
+  copTick += dt;
+  if (copTick > 0.8) { copTick = 0; copAssign(); }
+  copBusted(dt);
+}
 
 // ════════════════════════════════════════════════════════════
 //  行人:在街区矩形环道上散步,走到路口时偶尔横穿,被车逼近就四散,
@@ -986,7 +1191,7 @@ function updatePeds(dt) {
       const al = dx * Math.sin(hh) + dz * Math.cos(hh);
       const la = dx * Math.cos(hh) - dz * Math.sin(hh);
       if (Math.abs(al) < carGeo.L / 2 + 0.2 && Math.abs(la) < carGeo.W / 2 + 0.28) {
-        p.st = 2; p.lieT = 0; p.up = rand(3.5, 6.5); pedHits++;
+        p.st = 2; p.lieT = 0; p.up = rand(3.5, 6.5); pedHits++; addHeat(0.55);   // 碾行人入通缉热度(≈两命换一星)
         const fling = Math.min(7, carSpd * 0.45);
         p.fx = vx / carSpd * fling; p.fz = vz / carSpd * fling;
       }
@@ -1138,6 +1343,15 @@ const pSign = new THREE.InstancedMesh(unitBox,
 pSign.count = taxis.length;
 pSign.frustumCulled = false;
 scene.add(pSign);
+// 警灯闪条:红蓝各一根、6 个警员实例(c.lamp = 警车池下标)。池容量固定(加载建齐永不增删),
+// 所以不扩任何民用车实例网格;blanked 停编车由 writeCar 压到 -60 米藏形。
+const copIdx = {};
+copPool.forEach((c, j) => { copIdx[c.i] = j; });
+const pLampR = new THREE.InstancedMesh(unitBox, new THREE.MeshBasicMaterial({ color: 0xff3b30, toneMapped: false }), Math.max(1, copPool.length));
+const pLampB = new THREE.InstancedMesh(unitBox, new THREE.MeshBasicMaterial({ color: 0x2f6dff, toneMapped: false }), Math.max(1, copPool.length));
+pLampR.count = pLampB.count = Math.max(1, copPool.length);
+pLampR.frustumCulled = pLampB.frustumCulled = false;
+scene.add(pLampR, pLampB);
 
 function writeCar(c) {
   const g = GEO[c.g], e = IG[c.g], hide = c.blanked, y = hide ? -60 : 0;
@@ -1164,6 +1378,17 @@ function writeCar(c) {
     dummy.scale.setScalar(1);
     pSign.instanceMatrix.needsUpdate = true;
   }
+  if (c.t.cop) {                               // 黑白车顶红蓝闪条:0.2 秒一相交替(on/off 换缩放);blanked 停编直接整个压地下
+    const on = (((c.lampPol || 0) * 5) | 0) % 2 === 0;
+    const ly = hide ? -60 : g.roofY + 0.07, li = copIdx[c.i];
+    dummy.scale.set(on ? 0.38 : 0.03, on ? 0.14 : 0.03, on ? 0.5 : 0.03);
+    for (const [im, side] of [[pLampR, -1], [pLampB, 1]]) {
+      dummy.position.set(c.x - Math.cos(c.ry) * 0.23 * side, ly, c.z - Math.sin(c.ry) * 0.23 * side);
+      dummy.updateMatrix(); im.setMatrixAt(li, dummy.matrix);
+      im.instanceMatrix.needsUpdate = true;
+    }
+    dummy.scale.setScalar(1);
+  }
   e.body.instanceMatrix.needsUpdate = true;
   e.cab.instanceMatrix.needsUpdate = true;
   pWheel.instanceMatrix.needsUpdate = true;
@@ -1178,7 +1403,8 @@ function useHero(c) {
   hero = heroes[c.g];
   hero.userData.paint.color.setHex(c.color);
   hero.userData.roof.color.setHex(c.color).multiplyScalar(0.82);
-  if (hero.userData.sign) hero.userData.sign.visible = !!c.t.sign;   // 只有出租车才亮顶灯
+  if (hero.userData.sign) hero.userData.sign.visible = !!c.t.sign;   // 出租车顶灯只有出租车涂装才亮
+  if (hero.userData.coplamp) for (const o of hero.userData.coplamp) o.visible = !!c.t.cop;   // 抢了警车开,车顶红蓝也得跟着您闪(用户点名可抢)
 }
 function hideHeroes() { for (const k in heroes) heroes[k].visible = false; }
 
@@ -1310,9 +1536,17 @@ let hero = null;
       box(dark, bW * 0.24, g.by + bH * 0.45, bZ - bL / 2 - 0.01, 0.04, bH * 0.85, 0.06);
       box(dark, 0, g.by + bH * 0.98, bZ, bW * 0.98, 0.06, bL * 0.98);
     }
-    const sign = g.key === 'sedan' ? box(new THREE.MeshBasicMaterial({ color: 0xffe9a8, toneMapped: false },
-      0, g.roofY + 0.16, cZ, 0.74, 0.2, 0.3)) : null;
-    if (sign) sign.visible = false;               // 只有出租车涂装才亮
+    // 出租车顶灯:box() 返回的是 scale(Vector3)不是网格,原来把返回值挂 userData,
+    // "只有出租车涂装才亮"那句其实从没遮罩住任何东西 —— 那只小盒顶着一头 NaN 坐标挂着,
+    // NaN 在 GPU 上退化成看不见,才没人发现。这里改走 add 直接拿网格,visible 开关才是真的。
+    const sign = g.key === 'sedan' ? add(unitBox, new THREE.MeshBasicMaterial({ color: 0xffe9a8, toneMapped: false }),
+      0, g.roofY + 0.16, cZ) : null;
+    if (sign) { sign.scale.set(0.74, 0.2, 0.3); sign.visible = false; }
+    // 警灯条:主角车精模每型都带(抢警车开时 useHero 才显形)
+    const lampA = add(unitBox, new THREE.MeshBasicMaterial({ color: 0xff3b30, toneMapped: false }), -0.21, g.roofY + 0.09, cZ);
+    const lampB = add(unitBox, new THREE.MeshBasicMaterial({ color: 0x2f6dff, toneMapped: false }), 0.21, g.roofY + 0.09, cZ);
+    lampA.scale.set(0.38, 0.13, 0.48); lampB.scale.set(0.38, 0.13, 0.48);
+    lampA.visible = lampB.visible = false;
 
     const tireGeo = new THREE.CylinderGeometry(g.wr, g.wr, g.ww, 16).rotateZ(Math.PI / 2);
     const rimGeo = new THREE.CylinderGeometry(g.wr * 0.58, g.wr * 0.58, g.ww + 0.02, 10).rotateZ(Math.PI / 2);
@@ -1334,6 +1568,7 @@ let hero = null;
     grp.userData.paint = paint;      // 抢来的车要换成它的车漆
     grp.userData.roof = roof;
     grp.userData.sign = sign;
+    grp.userData.coplamp = [lampA, lampB];
     grp.visible = false;
     scene.add(grp);
     return grp;
@@ -1424,7 +1659,10 @@ const spawn = () => {
 };
 spawn();
 
-function placeAt(x, z, h) { if (inside) exitShop(); putCarAt(x, z, h); }   // 在店里被 R/harness 拽走:先算出门,再把人塞进车
+function placeAt(x, z, h) {
+  if (inside) exitShop(); putCarAt(x, z, h);         // 在店里被 R/harness/被捕 拽走:先算出门,再把人塞进车
+  if (man.visible) man.visible = false;              // 被捕那刻在步行:exitShop 按"人留在街上"点亮了 man,placeAt 之后人在车里,不补这刀会穿帮成"车里有人、车旁还站一个人"
+}
 
 // 最近路口(按网格吸附)
 function nearestCrossing(x, z) {
@@ -1453,14 +1691,27 @@ function pushOutStatic(x, z, r) {           // 只被静止障碍顶:车流之�
   for (let i = 0; i < solids.length; i++) {
     if (solidsOff.has(i)) continue;
     const s = solids[i];
-    if (s.car && s.car.trafficAI) continue;
+    // 追捕车之间互不顶(2026-11-10):两辆抢同一个停编位,中心落进对方车盒会被"最浅面"整个
+    // 顶出 3~6 米 —— 刚停好的车被顶出围捕带,俩车永远换着位置骑游。警察穿警察,街机可接受。
+    if (s.car && (s.car.trafficAI || s.car.police === 'chase')) continue;
     const nx = Math.max(s.x - s.hw, Math.min(x, s.x + s.hw));
     const nz = Math.max(s.z - s.hd, Math.min(z, s.z + s.hd));
     const dx = x - nx, dz = z - nz, d2 = dx * dx + dz * dz;
     if (d2 > r * r) continue;
-    const d = Math.sqrt(d2);
-    const ux = d > 1e-6 ? dx / d : 0, uz = d > 1e-6 ? dz / d : 1;
-    x += ux * (r - d); z += uz * (r - d);
+    if (d2 > 1e-9) {
+      const d = Math.sqrt(d2);
+      x += (dx / d) * (r - d); z += (dz / d) * (r - d);
+    } else {
+      // 中心整个落进盒里:"点到矩形"的尺子这时算出 0,旧版一律按 +z 顶 r 米 —— 实拍教训
+      // (2026-11-10 属性陷阱钉死):追捕警车拱进 20 米宽的楼,每帧被顶 1 米往北漂,车头
+      // 照拧人照飞,歪着对角线越开越偏。改成从最浅的面整个顶出去(还留 r 余量),谁埋谁现形。
+      const L = x - (s.x - s.hw), R = (s.x + s.hw) - x, D = z - (s.z - s.hd), U = (s.z + s.hd) - z;
+      const m = Math.min(L, R, D, U);
+      if (m === L) x = s.x - s.hw - r;
+      else if (m === R) x = s.x + s.hw + r;
+      else if (m === D) z = s.z - s.hd - r;
+      else z = s.z + s.hd + r;
+    }
   }
   return { x, z };
 }
@@ -2219,7 +2470,8 @@ function punch() {
   best.re = 0;
   const d = Math.hypot(best.x - px, best.z - pz) || 1;
   best.x += (best.x - px) / d * 0.5; best.z += (best.z - pz) / d * 0.5;   // 退半步
-  pedHits++;   // HUD"撞人"直接报成"撞/打人" —— 不加计数器不加键位,见 index.html 那行文案
+  pedHits++; addHeat(0.18);   // HUD"撞人"直接报成"撞/打人" —— 不加计数器不加键位,见 index.html 那行文案;
+  // 拳头命中也喂通缉:光脚当街耍横慢慢攒星(0.18/下,≈6 下一星)—— 只算打中人的那下,挥空不涨
 }
 
 // F:开车 -> 下车,站在车门边,车留在原地;步行 -> 上「最近的一辆车」(不限自己那辆)
@@ -2415,6 +2667,7 @@ function frame(now) {
   last = now;
   if (raw > 0) { sumDt += dt; sumReal += Math.min(0.5, raw); }
   tNow += dt;
+  if (bustShowT > 0) bustShowT -= Math.min(0.5, raw);   // BUSTED 横幅按真实时间走(和拳头冷却同一座钟):慢动作机器上它才不至于赖着不走
 
   if (state === 'play') {
     const up = keys.has('arrowup') || keys.has('w');
@@ -2450,6 +2703,7 @@ function frame(now) {
 
       const imp = resolveCar(g.r);    // 撞击(楼/车都算):吃掉法向速度,不做二次解析(大车碰撞半径更大)
       if (imp > 6 && hitCool <= 0) { hits++; hitCool = 0.5; }
+      if (hitSoft > 9) addHeat(0.06);          // 高速软顶会让路的民用流车 / 硬闯追捕车:蛮干涨热(蹭停着的巡逻车、顶楼墙都不涨)
 
       steerVis += (steer - steerVis) * Math.min(1, dt * 9);
       hero.position.set(hx, 0, hz);
@@ -2524,6 +2778,7 @@ function frame(now) {
     }
 
     updateTraffic(dt);
+    updatePolice(dt);
     updatePeds(dt);
     sun.position.set((mode === 'car' ? hx : px) - 40, 26, (mode === 'car' ? hz : pz) + 30);
     sun.target.position.set(mode === 'car' ? hx : px, 0, mode === 'car' ? hz : pz);
@@ -2537,6 +2792,10 @@ function frame(now) {
   $('kmh').style.opacity = mode === 'car' ? '' : '0';   // 步行时速度表让位:那块大数是汽车的仪表盘,人走路报 5km/h 没意义
   $('modev').textContent = mode === 'car' ? '开车' : '步行';
   $('hitsv').textContent = hits;
+  const stv = $('stars');
+  stv.textContent = '★'.repeat(stars) + '☆☆☆'.slice(stars);   // 3 星档(用户选型):右上角 ☆☆☆ → ★★★
+  stv.classList.toggle('on', stars > 0);
+  $('bustShow').style.opacity = bustShowT > 0 ? '1' : '0';
   $('pedsv').textContent = pedHits;
   $('blocksv').textContent = blockTypes.filter((t) => t === 0).length + ' 楼区 / ' + parks.length + ' 公园 / ' + lots.length + ' 停车场';
   // 门口提示:走近某家店报"按 E 进入 XX",在店里常驻"按 E 离店"(店里有去无回会懵)
@@ -2552,6 +2811,7 @@ function frame(now) {
 // 车的碰撞(直接改 vx/vz,避开上面那个绕来绕去的写法)
 function resolveCar(r) {
   let hitSpeed = 0;
+  hitSoft = 0;                                       // 本帧"软顶"峰值:通缉热度在帧尾读它(hits 计数不掺进来,两本账各记各的)
   for (let i = 0; i < solids.length; i++) {
     if (solidsOff.has(i)) continue;
     const s = solids[i];
@@ -2563,9 +2823,10 @@ function resolveCar(r) {
     let ux, uz, dd = Math.sqrt(d2);
     if (dd > 1e-6) { ux = dx / dd; uz = dz / dd; } else { ux = 0; uz = 1; dd = 0; }
     hx += ux * (r - dd); hz += uz * (r - dd);
-    const soft = s.car && s.car.trafficAI;     // 撞的是会让路的车流车,不是墙
+    const soft = s.car && (s.car.trafficAI || s.car.police === 'chase');   // 会让路的车流车 + 顶上的追捕警车:都是"顶得动的活物",不是墙
     if (soft) { s.car.x -= ux * (r - dd) * 0.9; s.car.z -= uz * (r - dd) * 0.9; s.car.spd *= 0.3; }
     const vn = vx * ux + vz * uz;
+    if (soft && vn < 0) hitSoft = Math.max(hitSoft, -vn);   // 软顶力道只进通缉热,不撞 hits 那本账
     if (vn < 0) { hitSpeed = Math.max(hitSpeed, -vn); const k = soft ? 0.75 : 1.25; vx -= ux * vn * k; vz -= uz * vn * k; }
   }
   vf = Math.sin(hh) * vx + Math.cos(hh) * vz;
@@ -2653,6 +2914,32 @@ window.__gta = {
   get lateral() { return +vr.toFixed(2); },
   get odo() { return +odo.toFixed(1); },
   get hits() { return hits; },
+  // ── 通缉/警察(3 星档:追捕车 = 星+1、封顶 4;0 星常驻 2 辆巡逻可抢)──
+  get stars() { return stars; },
+  get heat() { return +heat.toFixed(2); },
+  get busts() { return busts; },
+  get bustTimer() { return +bustT.toFixed(2); },        // 被捕倒计时读数(围住才涨、挣脱回吐),断言"挣脱有效"用
+  get bustShow() { return +bustShowT.toFixed(2); },     // BUSTED 横幅剩余秒数(慢动作机器上按真实时间 ≤0.5/s 退,和拳头冷却同钟)
+  get cops() {                                          // 6 辆警车点名:patrol/chase/pool 三态 + 离您多远
+    const [ax, az] = heroPos2();
+    return copPool.map((c) => ({ i: c.i, police: c.police, x: +c.x.toFixed(1), z: +c.z.toFixed(1),
+      spd: +(c.spd || 0).toFixed(1), blanked: !!c.blanked, driven: c === active,
+      d: +Math.hypot(c.x - ax, c.z - az).toFixed(1) }));
+  },
+  copChasers() { return copPool.filter((c) => c.police === 'chase' && !c.blanked).length; },
+  nearestCop() {                                        // 追捕/被捕断言的瞄准镜:优先此刻真在追的车,别拿远处巡逻充数
+    const ch = copPool.filter((c) => c.police === 'chase' && !c.blanked);
+    const best = (ch.length ? ch : copPool.filter((c) => c.police !== 'pool' && !c.blanked))
+      .reduce((m, c) => (!m || Math.hypot(c.x - (mode === 'car' ? hx : px), c.z - (mode === 'car' ? hz : pz)) <
+        Math.hypot(m.x - (mode === 'car' ? hx : px), m.z - (mode === 'car' ? hz : pz)) ? c : m), null);
+    return best ? { i: best.i, x: +best.x.toFixed(1), z: +best.z.toFixed(1), police: best.police,
+      spd: +(best.spd || 0).toFixed(1), d: +Math.hypot(best.x - (mode === 'car' ? hx : px), best.z - (mode === 'car' ? hz : pz)).toFixed(1) } : null;
+  },
+  setHeat(v, grace) {                                   // harness 专用:直接设热度(重放被捕/消热链不用重演犯罪)
+    heat = Math.max(0, Math.min(4.5, +v || 0));
+    lastCrime = tNow - 9 + (+grace || 0);               // grace=8:像刚犯完事,清静满 8 仿真秒才开始消(被捕链别被秒灭的星饿死)
+    return stars = STAR_T.filter((t) => heat >= t).length;
+  },
   get solidCount() { return solids.length; },
   get solids() { return solids; },
   get blocks() { return blockTypes.length; },
@@ -2662,7 +2949,8 @@ window.__gta = {
   get myCarId() { return myCar ? myCar.i : -1; },
   get carVisible() { return active ? (!!hero && hero.visible) : (!!myCar && !myCar.blanked); },
   get carType() { return active ? active.t.name : (myCar ? myCar.t.name : null); },
-  get carTypes() { const m = {}; cars.forEach((c) => { m[c.t.name] = (m[c.t.name] || 0) + 1; }); return m; },
+  get carTypes() { const m = {}; cars.forEach((c) => { if (c.t.cop) return;   // 警色 = 通缉系统班底,不参与民用车型分布盘点(那条断言数的是"街上民用车种齐不齐")
+    m[c.t.name] = (m[c.t.name] || 0) + 1; }); return m; },
   get myCarTop() { return active ? +(CAR_MAX * active.top).toFixed(1) : 0; },
   get selfBlocked() { return !!active && !solidsOff.has(active.solid); },   // 被自己的碰撞盒挡住 = true
   get solidsOffCount() { return solidsOff.size; },
@@ -2785,6 +3073,7 @@ window.__gta = {
     const c = cars[i];
     return c ? { x: +c.x.toFixed(2), z: +c.z.toFixed(2), spd: +(c.spd || 0).toFixed(2), ry: +c.ry.toFixed(3),
                  type: c.t.name, L: GEO[c.g].L, W: GEO[c.g].W, trafficAI: !!c.trafficAI, blanked: !!c.blanked,
+                 police: c.police, cop: !!c.t.cop,
                  want: +(c.want ?? -99).toFixed(2), cruise: +(c.cruise ?? -1).toFixed(2), axis: c.axis || '?',
                  dir: c.dir || 0, turn: !!c.turn, stuck: +(c.stuck || 0).toFixed(2), escalate: +(c.escalate || 0).toFixed(2) } : null;
   },

@@ -19,6 +19,14 @@
   #mode b{ display:block; font-size:13px; color:var(--accent); letter-spacing:.1em; }
   #mode span{ font-size:11px; color:var(--dim); letter-spacing:.14em; text-transform:uppercase; }
   #hits{ position:absolute; left:20px; top:62px; font-size:13px; color:var(--dim); }
+  #wanted{ position:absolute; right:22px; top:14px; text-align:right; }
+  #wanted span{ display:block; font-size:10px; letter-spacing:.18em; text-transform:uppercase; color:var(--dim); }
+  #wanted b{ font-size:26px; letter-spacing:.14em; color:#3d4660; line-height:1.2; }
+  #wanted b.on{ color:var(--accent); text-shadow:0 0 14px rgba(255,207,92,.55); }
+  #bustShow{ position:absolute; left:50%; top:26%; transform:translateX(-50%); padding:10px 30px; border-radius:12px;
+    background:rgba(20,26,36,.82); border:1px solid rgba(255,207,92,.4); color:var(--accent);
+    font-size:26px; font-weight:700; letter-spacing:.3em; text-indent:.3em; opacity:0; transition:opacity .18s; white-space:nowrap; }
+  #bustShow em{ font-style:normal; margin-left:14px; font-size:14px; font-weight:600; letter-spacing:.1em; color:var(--ink); }
   #keys{ position:absolute; left:20px; bottom:18px; font-size:12px; color:var(--dim); max-width:44ch; }
   #keys b{ color:var(--ink); }
   #hint{ position:absolute; left:50%; bottom:86px; transform:translateX(-50%); padding:6px 14px; border-radius:9px;
@@ -45,9 +53,11 @@
 <canvas id="c"></canvas>
 
 <div id="hud">
+  <div id="wanted"><span>通缉 wanted</span><b id="stars">☆☆☆</b></div>
   <div id="mode"><span>状态</span><b id="modev">开车</b></div>
   <div id="hits">撞击 <b id="hitsv">0</b> 次 · 撞/打人 <b id="pedsv">0</b> 人 · 街区 <b id="blocksv">0</b></div>
   <div id="kmh"><b id="kmh">0</b><span>km/h</span></div>
+  <div id="bustShow">BUSTED<em>被捕了 · 通缉清零 · 回到路口</em></div>
   <div id="hint"></div>
   <div id="keys"><b>驾驶</b> <kbd>↑</kbd><kbd>↓</kbd>/<kbd>W</kbd><kbd>S</kbd> 油门刹车 · <kbd>←</kbd><kbd>→</kbd>/<kbd>A</kbd><kbd>D</kbd> 转向 · <kbd>Space</kbd> 手刹漂移<br>
     <b>步行</b> <kbd>WASD</kbd> 移动(W=屏幕纵深,A/D=横移) · <kbd>Shift</kbd> 跑 · <kbd>Space</kbd> 跳 · <kbd>F</kbd> 上下最近的车(可抢别人的) · <kbd>G</kbd> 打人 · <kbd>E</kbd> 进/出亮门店铺 · <kbd>R</kbd> 回到路口重来<br>
@@ -57,8 +67,9 @@
 <div id="veil">
   <div>
     <h1>侠盗街区</h1>
-    <div class="sub">第一期 · 驾驶 + 车流 + 行人</div>
-    <p>城市活了:右边来车你得让,行人逼近会闪、碾到会躺。<br>警察和任务还没来 —— 先把这满街的车和人开顺。</p>
+    <div class="sub">第一期 · 驾驶 + 车流 + 行人 + 警察</div>
+    <p>城市活了:右边来车你得让,行人逼近会闪、碾到会躺;黑白车在街上巡逻 —— 碾人、抡拳、顶车吃星,
+       警车会追会顶会围你,被按住就是 BUSTED(清星回路口);小店是安全屋,推门进去星会灭。任务还没来。</p>
     <div><button id="go">开始开车</button></div>
     <p style="margin-top:16px;font-size:12px"><a href="../">← 回去玩穿环飞行</a></p>
   </div>
